@@ -2,21 +2,33 @@
 name = "tauri-plugin-webusb"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.79"
+rust-version = "1.85"
 authors = ["tauri-webusb contributors"]
 description = "A Tauri v2 plugin porting the WebUSB API (navigator.usb) to Tauri desktop apps"
 license = "MIT"
 repository = "https://github.com/example/tauri-webusb"
 links = "tauri-plugin-webusb"
-# rust-version = 1.79 matches nusb's own MSRV, which is the binding
-# constraint in this crate's dependency tree (tauri 2.x itself needs a
-# broadly similar floor). See README.md's "Development environment" note:
-# this could not be verified against an actual 1.79+ toolchain in the
-# sandbox this crate was written in (capped at 1.75.0 via `apt`, no
-# `rustup`/network access to fetch newer) — the pure-logic modules
-# (hardening/error/models/origin/settings_logic) were compiled and tested
-# there regardless, since they have no nusb/tauri dependency and so aren't
-# affected by that floor.
+# rust-version = 1.85, re-checked (and raised from an earlier 1.79) during
+# this crate's security-hardening pass against pyside6-webusb v0.0.5.post5:
+# nusb 0.2.6 (Aug 2026) bumped its own MSRV from 1.79 to 1.85, and an
+# unpinned `url = "2"` (below) now pulls in `idna` -> `idna_adapter`, whose
+# current release requires Cargo's `edition2024` feature -- stable only
+# since 1.85 as well. Both were re-verified directly against
+# https://index.crates.io/ (nusb's and idna_adapter's own published
+# `rust-version`/edition, not secondhand) rather than assumed. `tauri` 2.x's
+# own MSRV moves independently on its stated "roughly three stable releases
+# behind current" policy (tauri-apps/tauri#11205's discussion), so it may
+# already be at or past 1.85 by the time this is read regardless of this
+# field — Cargo enforces whichever floor in the resolved dependency graph is
+# actually highest, not this declared number. See README.md's "Development
+# environment" note: none of this could be verified against a *real* 1.85+
+# toolchain in the sandbox this crate was written in (`apt`'s `rustc` is
+# capped at 1.75.0, and neither `rustup.rs` nor `static.rust-lang.org` were
+# reachable to fetch a newer one) — the pure-logic modules
+# (hardening/error/models/origin/settings_logic/gesture) were compiled and
+# genuinely tested there regardless, since none of them depend on nusb or
+# tauri and so aren't affected by that floor; see each module's own doc
+# comment for which ones.
 
 [lib]
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -32,6 +44,14 @@ tokio = { version = "1", features = ["sync", "time", "rt"] }
 url = "2"
 base64 = "0.22"
 nusb = "0.2"
+# Only the OS CSPRNG read (`gesture.rs`'s `mintGestureToken()` token) --
+# deliberately not the much heavier `rand` crate for one call site. Pinned
+# to the 0.2.x line (not 0.3/0.4) specifically because it, unlike `nusb`
+# and `url` above, declares *no* `rust-version` at all as of 0.2.17 and so
+# does not itself push this crate's floor any higher than nusb/url already
+# do -- confirmed against https://index.crates.io/ge/tr/getrandom the same
+# way as the two above, not assumed.
+getrandom = "0.2"
 
 [dev-dependencies]
 # Used only by settings_store.rs's filesystem-backed tests (temp-directory

@@ -1,6 +1,7 @@
 const COMMANDS: &[&str] = &[
     // page-facing WebUSB surface
     "get_devices",
+    "mint_gesture_token",
     "request_device",
     "open",
     "close",
