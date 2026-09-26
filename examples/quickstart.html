@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>tauri-webusb quickstart</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+  button { font: inherit; padding: 8px 16px; }
+  pre { background: #f3f3f3; padding: 12px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+  .error { color: #b91c1c; }
+</style>
+</head>
+<body>
+  <h1>tauri-webusb quickstart</h1>
+  <p>
+    Requests a device, opens it, claims interface 0, and issues one
+    <code>transferIn</code> against endpoint 1. Adjust the endpoint number
+    and filter for whatever device you're testing against — there's nothing
+    device-specific required to run this page itself.
+  </p>
+  <button id="connect">Request device…</button>
+  <pre id="log">(nothing yet)</pre>
+
+<script>
+const logEl = document.getElementById("log");
+function log(...args) {
+  logEl.textContent += "\n" + args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
+}
+
+document.getElementById("connect").addEventListener("click", async () => {
+  logEl.textContent = "";
+  logEl.classList.remove("error");
+  try {
+    if (!("usb" in navigator)) {
+      throw new Error("navigator.usb is not defined — is the plugin installed and this window capability-granted?");
+    }
+
+    log("Requesting device (a chooser window should appear)…");
+    const device = await navigator.usb.requestDevice({ filters: [{}] }); // {} matches any device
+    log("Selected:", device.productName || `${device.vendorId.toString(16)}:${device.productId.toString(16)}`);
+
+    await device.open();
+    log("Opened. Active configuration:", device.configuration?.configurationValue ?? "(none selected yet)");
+
+    if (!device.configuration) {
+      await device.selectConfiguration(device.configurations[0].configurationValue);
+      log("Selected configuration", device.configuration.configurationValue);
+    }
+
+    await device.claimInterface(0);
+    log("Claimed interface 0.");
+
+    const result = await device.transferIn(1, 64);
+    log("transferIn(1, 64) ->", result.status, Array.from(new Uint8Array(result.data.buffer)));
+
+    await device.close();
+    log("Closed.");
+  } catch (err) {
+    logEl.classList.add("error");
+    log(`${err.name || "Error"}: ${err.message}`);
+  }
+});
+
+navigator.usb?.addEventListener?.("connect", (e) => log("[connect event]", e.device.productName));
+navigator.usb?.addEventListener?.("disconnect", (e) => log("[disconnect event]", e.device.productName));
+</script>
+</body>
+</html>
