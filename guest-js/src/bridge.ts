@@ -163,9 +163,19 @@ export interface WireOpenResult {
 
 export const rpc = {
   getDevices: () => call<WireDevice[]>("get_devices"),
-  requestDevice: (filters: WireFilter[], exclusionFilters: WireFilter[]) =>
-    call<WireDevice>("request_device", { filters, exclusionFilters }),
-  open: (vendorId: number, productId: number) => call<WireOpenResult>("open", { vendorId, productId }),
+  /** See `polyfill.ts`'s `requestDevice()` for why this is minted and
+   * consumed as its own round trip rather than a parameter derived purely
+   * client-side: `hardening::GESTURE_TOKEN_TTL_SECS`'s doc comment (via
+   * `gesture.rs`) explains the server-side half of the check this backs. */
+  mintGestureToken: () => call<string>("mint_gesture_token"),
+  requestDevice: (filters: WireFilter[], exclusionFilters: WireFilter[], gestureToken: string) =>
+    call<WireDevice>("request_device", { filters, exclusionFilters, gestureToken }),
+  /** `serialNumber` is `undefined` for a device that doesn't report one, or
+   * for `getDevices()`-obtained devices this session never disambiguated —
+   * see `polyfill.ts`'s `USBDevice.open()`, which passes its own already-known
+   * `serialNumber` through automatically; page code never supplies this
+   * directly (real `USBDevice.open()` takes no arguments at all, per spec). */
+  open: (vendorId: number, productId: number, serialNumber?: string) => call<WireOpenResult>("open", { vendorId, productId, serialNumber }),
   close: (handle: number) => call<void>("close", { handle }),
   forget: (handle: number) => call<void>("forget", { handle }),
   selectConfiguration: (handle: number, configurationValue: number) =>

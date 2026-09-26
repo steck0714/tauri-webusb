@@ -14,7 +14,7 @@
 //
 // Either path calls the same `installWebUsbPolyfill()` below.
 
-import { USB } from "./polyfill.js";
+import { USB, USBDevice, USBConnectionEvent } from "./polyfill.js";
 
 export {
   USB,
@@ -83,5 +83,26 @@ export function installWebUsbPolyfill(options: InstallOptions = {}): boolean {
     enumerable: true,
     configurable: true, // matches real Chrome's own navigator.usb descriptor — lets a test harness replace it
   });
+
+  // Ported from pyside6-webusb v0.0.5.post5: some feature-detection and
+  // "is WebUSB available" code in the wild checks for the *constructor*
+  // (`window.USBDevice`, `"USBDevice" in window`), not only for
+  // `navigator.usb` itself. A real browser exposes these as ordinary
+  // `Window` properties (`[Exposed=Window] interface USBDevice`, etc. — see
+  // the WebUSB IDL), so this mirrors that rather than being a Tauri- or
+  // polyfill-specific addition. Each is defined independently and only if
+  // genuinely absent (`in window`, not `options.force`, which only governs
+  // `navigator.usb` above) — a page's own unrelated global named `USB`
+  // should never be clobbered just because installing this polyfill was
+  // otherwise a no-op for it.
+  if (typeof window !== "undefined") {
+    const globals: Record<string, unknown> = { USB, USBDevice, USBConnectionEvent };
+    for (const [name, value] of Object.entries(globals)) {
+      if (!(name in window)) {
+        Object.defineProperty(window, name, { value, writable: true, enumerable: false, configurable: true });
+      }
+    }
+  }
+
   return true;
 }

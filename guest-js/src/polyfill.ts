@@ -357,7 +357,14 @@ export class USBDevice {
   async open(): Promise<void> {
     if (this.#handle !== null) return; // spec: open() on an already-open device is a no-op
     try {
-      const result = await rpc.open(this.#wire.vendorId, this.#wire.productId);
+      // `serialNumber` disambiguates multiple simultaneously-connected
+      // devices sharing one vendorId/productId pair — see `bridge::open_device`'s
+      // doc comment on the Rust side. This is *not* a new parameter page code
+      // supplies: real `USBDevice.open()` takes no arguments at all per spec,
+      // and this object already carries its own serialNumber (if the device
+      // reports one) from whichever `getDevices()`/`requestDevice()` call
+      // produced it — passed through here transparently.
+      const result = await rpc.open(this.#wire.vendorId, this.#wire.productId, this.#wire.serialNumber ?? undefined);
       this.#handle = result.handle;
       this.#wire = result.descriptor;
     } catch (e) {
@@ -660,7 +667,17 @@ export class USB extends EventTarget {
     const filters = checkFilters(options?.filters ?? [], "filters");
     const exclusionFilters = checkFilters(options?.exclusionFilters ?? [], "exclusionFilters");
     try {
-      const wire = await rpc.requestDevice(filters, exclusionFilters);
+      // 🛡️ security_report/VULNERABILITY_REPORT.md finding No.2 (see
+      // `gesture.rs`'s module doc comment): this check above is necessary
+      // but not sufficient on its own, since it runs in the page's own JS
+      // context — any other script on the page (or a direct
+      // `invoke("plugin:webusb|request_device", ...)` call, bypassing this
+      // polyfill entirely) could skip it. Minting the token *here*, right
+      // after confirming activation is genuinely active, and having Rust
+      // require and consume it before ever showing the chooser window, is
+      // what actually enforces this rather than merely asking nicely.
+      const gestureToken = await rpc.mintGestureToken();
+      const wire = await rpc.requestDevice(filters, exclusionFilters, gestureToken);
       return this.#trackDevice(wire);
     } catch (e) {
       return throwFromRpcError(e);
