@@ -1,0 +1,38 @@
+[package]
+name = "tauri-plugin-webusb"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.79"
+authors = ["tauri-webusb contributors"]
+description = "A Tauri v2 plugin porting the WebUSB API (navigator.usb) to Tauri desktop apps"
+license = "MIT"
+repository = "https://github.com/example/tauri-webusb"
+links = "tauri-plugin-webusb"
+# rust-version = 1.79 matches nusb's own MSRV, which is the binding
+# constraint in this crate's dependency tree (tauri 2.x itself needs a
+# broadly similar floor). See README.md's "Development environment" note:
+# this could not be verified against an actual 1.79+ toolchain in the
+# sandbox this crate was written in (capped at 1.75.0 via `apt`, no
+# `rustup`/network access to fetch newer) — the pure-logic modules
+# (hardening/error/models/origin/settings_logic) were compiled and tested
+# there regardless, since they have no nusb/tauri dependency and so aren't
+# affected by that floor.
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[dependencies]
+tauri = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+url = "2"
+base64 = "0.22"
+nusb = "0.2"
+
+[dev-dependencies]
+# Used only by settings_store.rs's filesystem-backed tests (temp-directory
+# read/write/rename round trips) — no device or Tauri-runtime dependency.

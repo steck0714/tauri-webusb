@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 steck0714
+Copyright (c) 2026 tauri-webusb contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,34 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+--------------------------------------------------------------------------
+
+This project is a port of the WebUSB API to Tauri, informed by two earlier
+MIT-licensed projects that solved the same underlying problem (giving a
+non-Chromium desktop webview a `navigator.usb`) for different host
+environments:
+
+  - pyside6-webusb -- a QtWebEngine/PySide6 desktop-app implementation.
+  - fox-webusb -- a Firefox-extension port of pyside6-webusb v0.0.4b0.
+
+No source files were copied verbatim from either project (the runtime
+architectures involved -- a Qt bridge, a Firefox WebExtension plus a native
+messaging host, and a Tauri plugin -- are different enough that a line-level
+port wasn't applicable), but the security model this project implements
+(hardening.rs: protected interface classes, the device blocklist, filter
+matching, transfer-size policy) is a direct translation of the design and,
+in several specific documented cases, the exact reasoning developed across
+both of those projects -- see README.md's "Relationship to prior art"
+section for the specifics, including which fixes were carried forward from
+which version of which project.
+
+This project depends on, but does not redistribute:
+  - Tauri (MIT/Apache-2.0) and the Tauri plugin crates it builds on.
+  - nusb (MIT/Apache-2.0), for USB device access.
+  - serde, serde_json, tokio, url, base64 (MIT/Apache-2.0), and
+    @tauri-apps/api (MIT/Apache-2.0) on the guest-js side.
+
+This project does not depend on or bundle Python, Qt/PySide6, pyusb, or any
+Firefox-specific WebExtension API -- it is a from-scratch Rust/TypeScript
+implementation against Tauri's own plugin architecture.
