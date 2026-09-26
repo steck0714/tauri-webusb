@@ -1,0 +1,77 @@
+# Granting `"webusb:default"` to a window in its capability file exposes the
+# page-facing `navigator.usb` surface to whatever content that window loads,
+# plus the internal commands the chooser window this plugin creates needs to
+# call on itself.
+#
+# It deliberately does NOT include the trusted-management commands
+# (listGrantedOrigins, revokeOriginGrant, listKnownDevices, ...) — see
+# manage.toml and README.md's "Trust model" section for why those need a
+# separate, narrower grant.
+#
+# Per-command `allow-*`/`deny-*` permissions referenced below are generated
+# automatically by `build.rs` (`tauri_plugin::Builder::new(COMMANDS)`), one
+# pair per entry in that file's `COMMANDS` list — they don't need (and
+# shouldn't get) their own hand-written `[[permission]]` blocks here.
+
+[[set]]
+identifier = "default"
+description = """
+Enables the page-facing WebUSB API surface (getDevices, requestDevice, open,
+transfers, ...) plus the internal commands the device-chooser window this
+plugin creates needs to call on itself. Does not include the trusted
+device/origin management surface — see the separate `manage` permission set.
+"""
+permissions = [
+    "allow-get-devices",
+    "allow-request-device",
+    "allow-open",
+    "allow-close",
+    "allow-forget",
+    "allow-select-configuration",
+    "allow-claim-interface",
+    "allow-release-interface",
+    "allow-select-alternate-interface",
+    "allow-reset-device",
+    "allow-clear-halt",
+    "allow-control-transfer-in",
+    "allow-control-transfer-out",
+    "allow-transfer-in",
+    "allow-transfer-out",
+    "allow-isochronous-transfer-in",
+    "allow-isochronous-transfer-out",
+    "allow-chooser-list-candidates",
+    "allow-chooser-select",
+    "allow-chooser-cancel",
+]
+
+[[set]]
+identifier = "page"
+description = """
+Alias for `default`, kept as its own name for capability files that want to
+be explicit that this grant is specifically "the page-facing WebUSB API",
+matching this plugin's own two-tier "page" vs "manage" terminology (see
+commands.rs's module doc comment) rather than relying on the implicit
+meaning of `default`.
+"""
+permissions = [
+    "allow-get-devices",
+    "allow-request-device",
+    "allow-open",
+    "allow-close",
+    "allow-forget",
+    "allow-select-configuration",
+    "allow-claim-interface",
+    "allow-release-interface",
+    "allow-select-alternate-interface",
+    "allow-reset-device",
+    "allow-clear-halt",
+    "allow-control-transfer-in",
+    "allow-control-transfer-out",
+    "allow-transfer-in",
+    "allow-transfer-out",
+    "allow-isochronous-transfer-in",
+    "allow-isochronous-transfer-out",
+    "allow-chooser-list-candidates",
+    "allow-chooser-select",
+    "allow-chooser-cancel",
+]

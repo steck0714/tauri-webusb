@@ -1,0 +1,32 @@
+# Grant `"webusb:manage"` ONLY to a window that shows this plugin host app's
+# own trusted UI — never to a window that loads third-party/remote content.
+# These commands can enumerate every origin ever granted a device and revoke
+# or inspect that history; there is no per-origin scoping on them the way
+# there is on the page-facing surface, by design (a device/origin management
+# screen is inherently a whole-app-scope, not a per-origin-scope, concept).
+#
+# Example capability file granting this only to a window labeled
+# "settings" (see README.md's "Trust model" section for the full example):
+#
+#   {
+#     "identifier": "webusb-management",
+#     "windows": ["settings"],
+#     "permissions": ["webusb:manage"]
+#   }
+
+[[set]]
+identifier = "manage"
+description = """
+Enables the trusted device/origin management surface: listing every granted
+origin and its devices, revoking a grant (single device or all of an
+origin's), and listing/forgetting entries in the known-devices history. Grant
+this only to a window showing this plugin host app's own trusted UI.
+"""
+permissions = [
+    "allow-list-granted-origins",
+    "allow-revoke-origin-grant",
+    "allow-revoke-all-for-origin",
+    "allow-list-known-devices",
+    "allow-forget-known-device",
+    "allow-forget-all-known-devices",
+]
