@@ -18,7 +18,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "pretest": "tsc",
-    "test": "node --test dist-js/__tests__/"
+    "test": "node --test \"dist-js/**/*.test.js\""
   },
   "license": "MIT",
   "repository": {
