@@ -1,0 +1,175 @@
+<!doctype html>
+<!--
+  This page is compiled directly into the plugin binary (chooser.rs:
+  `include_str!("../chooser-ui/index.html")`) and loaded as a `data:` URL —
+  it is never served from disk, never part of any app's own bundled
+  frontend, and never reachable by any origin other than being shown as its
+  own dedicated window. It talks to the plugin's chooser-only commands via
+  Tauri's raw `window.__TAURI_INTERNALS__.invoke` (not the `@tauri-apps/api`
+  package — there is no bundler step for this file, and pulling in a whole
+  package for three plain `invoke()` calls would be a lot of ceremony for a
+  46-line script). See chooser.rs's module doc comment for why those
+  commands are safe to expose this way (gated by this window's own identity,
+  not by anything this page's JS asserts about itself).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Select a device</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px 16px 12px;
+    font: 13px/1.4 -apple-system, "Segoe UI", system-ui, sans-serif;
+    background: Canvas; color: CanvasText;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  }
+  h1 { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
+  p.sub { margin: 0 0 12px; color: color-mix(in srgb, CanvasText 60%, transparent); font-size: 12px; word-break: break-all; }
+  .list { flex: 1; overflow-y: auto; border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius: 6px; }
+  .row {
+    padding: 8px 10px; cursor: default; display: flex; flex-direction: column; gap: 2px;
+    border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent);
+  }
+  .row:last-child { border-bottom: none; }
+  .row:hover { background: color-mix(in srgb, CanvasText 6%, transparent); }
+  .row.selected { background: light-dark(#0a6cff22, #3a8bff33); outline: 1px solid light-dark(#0a6cff88, #3a8bff88); outline-offset: -1px; }
+  .row .name { font-weight: 500; }
+  .row .detail { font-size: 11px; color: color-mix(in srgb, CanvasText 55%, transparent); }
+  .row .warn { font-size: 11px; color: #b45309; }
+  .empty { padding: 24px 12px; text-align: center; color: color-mix(in srgb, CanvasText 50%, transparent); }
+  .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  button {
+    font: inherit; padding: 6px 14px; border-radius: 5px; border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+    background: color-mix(in srgb, Canvas 100%, transparent); color: CanvasText; cursor: pointer;
+  }
+  button.primary { background: light-dark(#0a6cff, #3a8bff); border-color: transparent; color: white; }
+  button:disabled { opacity: 0.45; cursor: default; }
+</style>
+</head>
+<body>
+  <h1>Select a device to connect</h1>
+  <p class="sub" id="subtitle">Choose a device to grant this site access to.</p>
+  <div class="list" id="list"><div class="empty">Looking for devices…</div></div>
+  <div class="actions">
+    <button id="cancel">Cancel</button>
+    <button id="connect" class="primary" disabled>Connect</button>
+  </div>
+
+<script>
+(function () {
+  var invoke = window.__TAURI_INTERNALS__.invoke;
+  var listEl = document.getElementById('list');
+  var connectBtn = document.getElementById('connect');
+  var cancelBtn = document.getElementById('cancel');
+  var selected = null; // { vendorId, productId }
+  var devices = [];
+  var refreshTimer = null;
+  var closing = false;
+
+  function hex(n, width) {
+    var s = n.toString(16);
+    while (s.length < width) s = '0' + s;
+    return '0x' + s;
+  }
+
+  function deviceLabel(d) {
+    return d.productName || (hex(d.vendorId, 4) + ' / ' + hex(d.productId, 4));
+  }
+
+  function hasProtectedInterface(d) {
+    return (d.configurations || []).some(function (c) {
+      return (c.interfaces || []).some(function (i) {
+        return (i.alternates || []).some(function (a) { return a.interfaceProtected; });
+      });
+    });
+  }
+
+  function render() {
+    listEl.innerHTML = '';
+    if (devices.length === 0) {
+      var empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No matching devices found. Plug one in — this list updates automatically.';
+      listEl.appendChild(empty);
+      return;
+    }
+    devices.forEach(function (d) {
+      var row = document.createElement('div');
+      row.className = 'row' + (selected && selected.vendorId === d.vendorId && selected.productId === d.productId ? ' selected' : '');
+      var name = document.createElement('div');
+      name.className = 'name';
+      name.textContent = deviceLabel(d);
+      row.appendChild(name);
+      var detail = document.createElement('div');
+      detail.className = 'detail';
+      var bits = [hex(d.vendorId, 4) + ':' + hex(d.productId, 4)];
+      if (d.manufacturerName) bits.push(d.manufacturerName);
+      if (d.serialNumber) bits.push('S/N ' + d.serialNumber);
+      if (typeof d.connectCount === 'number' && d.connectCount > 0) bits.push('connected ' + d.connectCount + 'x before');
+      detail.textContent = bits.join(' · ');
+      row.appendChild(detail);
+      if (hasProtectedInterface(d)) {
+        var warn = document.createElement('div');
+        warn.className = 'warn';
+        warn.textContent = 'Some interfaces on this device (keyboard/storage/etc.) will stay off-limits even once connected.';
+        row.appendChild(warn);
+      }
+      row.addEventListener('click', function () {
+        selected = { vendorId: d.vendorId, productId: d.productId };
+        connectBtn.disabled = false;
+        render();
+      });
+      row.addEventListener('dblclick', function () {
+        selected = { vendorId: d.vendorId, productId: d.productId };
+        doConnect();
+      });
+      listEl.appendChild(row);
+    });
+  }
+
+  function refresh() {
+    invoke('plugin:webusb|chooser_list_candidates').then(function (result) {
+      devices = result || [];
+      // Keep the current selection only if it's still in the list —
+      // otherwise a device that was just unplugged would stay
+      // "selected" with a now-stale Connect button enabled.
+      if (selected && !devices.some(function (d) { return d.vendorId === selected.vendorId && d.productId === selected.productId; })) {
+        selected = null;
+        connectBtn.disabled = true;
+      }
+      render();
+    }).catch(function () {
+      // A transient failure here shouldn't tear down the whole dialog —
+      // just try again on the next tick.
+    });
+  }
+
+  function doConnect() {
+    if (!selected || closing) return;
+    closing = true;
+    clearInterval(refreshTimer);
+    connectBtn.disabled = true;
+    cancelBtn.disabled = true;
+    invoke('plugin:webusb|chooser_select', { vendorId: selected.vendorId, productId: selected.productId })
+      .catch(function () { /* window is about to close regardless */ });
+  }
+
+  function doCancel() {
+    if (closing) return;
+    closing = true;
+    clearInterval(refreshTimer);
+    invoke('plugin:webusb|chooser_cancel').catch(function () { /* window is about to close regardless */ });
+  }
+
+  connectBtn.addEventListener('click', doConnect);
+  cancelBtn.addEventListener('click', doCancel);
+  window.addEventListener('keydown', function (e) { if (e.key === 'Escape') doCancel(); });
+
+  refresh();
+  refreshTimer = setInterval(refresh, 1200);
+})();
+</script>
+</body>
+</html>
