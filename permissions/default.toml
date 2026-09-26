@@ -23,6 +23,7 @@ device/origin management surface — see the separate `manage` permission set.
 """
 permissions = [
     "allow-get-devices",
+    "allow-mint-gesture-token",
     "allow-request-device",
     "allow-open",
     "allow-close",
@@ -55,6 +56,7 @@ meaning of `default`.
 """
 permissions = [
     "allow-get-devices",
+    "allow-mint-gesture-token",
     "allow-request-device",
     "allow-open",
     "allow-close",
