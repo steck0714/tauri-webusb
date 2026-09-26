@@ -12,8 +12,9 @@
 //! Commands are split into two `permissions/*.toml` sets (see that
 //! directory's own files for the exact identifiers):
 //! - **page** — the `navigator.usb` surface itself
-//!   (`getDevices`/`requestDevice`/`open`/transfers/...). An app grants this
-//!   to any window/webview whose content should see `navigator.usb` at all.
+//!   (`getDevices`/`requestDevice`/`mintGestureToken`/`open`/transfers/...).
+//!   An app grants this to any window/webview whose content should see
+//!   `navigator.usb` at all.
 //! - **manage** — origin/device bookkeeping for a trusted management UI
 //!   (`listGrantedOrigins`, `revokeOriginGrant`, `listKnownDevices`, ...). An
 //!   app grants this *only* to its own trusted internal window, never to a
@@ -36,6 +37,7 @@ use crate::models::*;
 use crate::origin::origin_of;
 use crate::settings_logic::{GrantedDevice, KnownDevice};
 use crate::state::WebUsbState;
+use std::sync::Arc;
 use tauri::{command, State, Webview};
 
 fn require_origin<R: tauri::Runtime>(webview: &Webview<R>) -> Result<String, WebUsbError> {
@@ -59,29 +61,62 @@ pub async fn get_devices<R: tauri::Runtime>(webview: Webview<R>, state: State<'_
 }
 
 #[command]
+pub async fn mint_gesture_token(state: State<'_, WebUsbState>) -> Result<String, WebUsbError> {
+    Ok(state.gesture_tokens.mint().await)
+}
+
+#[command]
 pub async fn request_device<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     webview: Webview<R>,
     state: State<'_, WebUsbState>,
     filters: Vec<UsbDeviceFilter>,
     exclusion_filters: Vec<UsbDeviceFilter>,
+    gesture_token: String,
 ) -> Result<DeviceDescriptor, WebUsbError> {
     let origin = require_origin(&webview)?;
+    // 🛡️ security_report/VULNERABILITY_REPORT.md finding No.2 — see
+    // `gesture.rs`'s module doc comment for the full threat model this
+    // closes (and its limits). `guest-js/src/polyfill.ts`'s `requestDevice()`
+    // mints this immediately after confirming `navigator.userActivation.isActive`,
+    // so a legitimate call always carries a fresh one; failing this check is
+    // what actually stops a script bypassing the polyfill and invoking this
+    // command directly with no user interaction at all.
+    if !state.gesture_tokens.consume(&gesture_token).await {
+        return Err(WebUsbError::security(
+            "requestDevice() must be called as the direct result of a user gesture (e.g. inside a click handler)",
+        ));
+    }
+    if filters.len() > crate::hardening::MAX_DEVICE_FILTERS || exclusion_filters.len() > crate::hardening::MAX_DEVICE_FILTERS {
+        return Err(WebUsbError::not_found(format!(
+            "filters/exclusionFilters must not exceed {} entries each",
+            crate::hardening::MAX_DEVICE_FILTERS
+        )));
+    }
     for f in filters.iter().chain(exclusion_filters.iter()) {
         if !crate::hardening::is_valid_usb_device_filter(f) {
             return Err(WebUsbError::not_found("one or more filters is invalid (e.g. productId without vendorId)"));
         }
     }
-    let picked = chooser::run(&app, &state.chooser, &origin, filters, exclusion_filters).await?;
+    let picked = chooser::run(&app, Arc::clone(&state.chooser), &origin, filters, exclusion_filters).await?;
     let now = bridge::now_iso8601_pub();
-    state.settings.mutate(|d| { d.grant_origin(&origin, picked.vendor_id, picked.product_id, &now); ((), true) }).await;
+    state
+        .settings
+        .mutate(|d| {
+            d.grant_origin(&origin, picked.vendor_id, picked.product_id, &now);
+            ((), true)
+        })
+        .await
+        .map_err(|e| WebUsbError::invalid_state(format!("device was selected but access could not be saved: {e}")))?;
     Ok(picked)
 }
 
 #[command]
-pub async fn open<R: tauri::Runtime>(webview: Webview<R>, state: State<'_, WebUsbState>, vendor_id: u16, product_id: u16) -> Result<OpenResult, WebUsbError> {
+pub async fn open<R: tauri::Runtime>(
+    webview: Webview<R>, state: State<'_, WebUsbState>, vendor_id: u16, product_id: u16, serial_number: Option<String>,
+) -> Result<OpenResult, WebUsbError> {
     let origin = require_origin(&webview)?;
-    let (handle, descriptor) = bridge::open_device(&state.settings, &state.sessions, &origin, vendor_id, product_id).await?;
+    let (handle, descriptor) = bridge::open_device(&state.settings, &state.sessions, &origin, vendor_id, product_id, serial_number).await?;
     Ok(OpenResult { handle, descriptor })
 }
 
@@ -249,12 +284,26 @@ pub async fn list_granted_origins(state: State<'_, WebUsbState>) -> Result<std::
 
 #[command]
 pub async fn revoke_origin_grant(state: State<'_, WebUsbState>, origin: String, vendor_id: u16, product_id: u16) -> Result<bool, WebUsbError> {
-    Ok(state.settings.mutate(|d| { let removed = d.revoke_origin_grant(&origin, vendor_id, product_id); (removed, removed) }).await)
+    state
+        .settings
+        .mutate(|d| {
+            let removed = d.revoke_origin_grant(&origin, vendor_id, product_id);
+            (removed, removed)
+        })
+        .await
+        .map_err(|e| WebUsbError::invalid_state(format!("could not save the updated grant list: {e}")))
 }
 
 #[command]
 pub async fn revoke_all_for_origin(state: State<'_, WebUsbState>, origin: String) -> Result<usize, WebUsbError> {
-    Ok(state.settings.mutate(|d| { let n = d.revoke_all_for_origin(&origin); (n, n > 0) }).await)
+    state
+        .settings
+        .mutate(|d| {
+            let n = d.revoke_all_for_origin(&origin);
+            (n, n > 0)
+        })
+        .await
+        .map_err(|e| WebUsbError::invalid_state(format!("could not save the updated grant list: {e}")))
 }
 
 #[command]
@@ -264,12 +313,26 @@ pub async fn list_known_devices(state: State<'_, WebUsbState>) -> Result<Vec<Kno
 
 #[command]
 pub async fn forget_known_device(state: State<'_, WebUsbState>, vendor_id: u16, product_id: u16) -> Result<bool, WebUsbError> {
-    Ok(state.settings.mutate(|d| { let removed = d.forget_known_device(vendor_id, product_id); (removed, removed) }).await)
+    state
+        .settings
+        .mutate(|d| {
+            let removed = d.forget_known_device(vendor_id, product_id);
+            (removed, removed)
+        })
+        .await
+        .map_err(|e| WebUsbError::invalid_state(format!("could not save the updated device history: {e}")))
 }
 
 #[command]
 pub async fn forget_all_known_devices(state: State<'_, WebUsbState>) -> Result<usize, WebUsbError> {
-    Ok(state.settings.mutate(|d| { let n = d.forget_all_known_devices(); (n, n > 0) }).await)
+    state
+        .settings
+        .mutate(|d| {
+            let n = d.forget_all_known_devices();
+            (n, n > 0)
+        })
+        .await
+        .map_err(|e| WebUsbError::invalid_state(format!("could not save the updated device history: {e}")))
 }
 
 // ================================================================
@@ -278,6 +341,21 @@ pub async fn forget_all_known_devices(state: State<'_, WebUsbState>) -> Result<u
 
 fn decode_base64(s: &str) -> Result<Vec<u8>, WebUsbError> {
     use base64::Engine;
+    // 🛡️ Ported from pyside6-webusb v0.0.5.post5's "hardened options and
+    // base64 payload boundaries": reject an oversized *encoded* string
+    // before spending the allocation to decode it — see
+    // `hardening::MAX_BASE64_PAYLOAD_CHARS`'s doc comment. The
+    // already-existing post-decode length checks in `bridge.rs` (against
+    // `HOST_SAFETY_MAX_TRANSFER_LENGTH`/the isochronous/control-transfer
+    // equivalents) still run as before; this only moves the worst case
+    // earlier, before the large allocation, rather than after it.
+    if s.len() > crate::hardening::MAX_BASE64_PAYLOAD_CHARS {
+        return Err(WebUsbError::data_error(format!(
+            "payload is too large ({} base64 characters, maximum {})",
+            s.len(),
+            crate::hardening::MAX_BASE64_PAYLOAD_CHARS
+        )));
+    }
     // NotFoundError here is a deliberate, if imperfect, choice: this can
     // only happen if the guest-js layer itself sent malformed data (a bug
     // in this plugin's own polyfill, not something a page's own JS can

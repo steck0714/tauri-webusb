@@ -22,11 +22,29 @@ pub struct WebUsbState {
     /// plain value or (as here) an `Arc` — deref coercion handles it.
     pub settings: Arc<SettingsStore>,
     pub sessions: SessionRegistry,
-    pub chooser: ChooserRegistry,
+    /// `Arc`, for the same reason `gesture_tokens` isn't and `settings` is:
+    /// `chooser::run` needs to hand a `'static` handle to the closure it
+    /// registers on the chooser window's close event (see that function's
+    /// doc comment) — `Arc::clone` there, rather than reconstructing a
+    /// reference from a raw pointer cast, needs this to already be
+    /// `Arc`-wrapped here. `candidates_for`/`submit_selection`/
+    /// `submit_cancel` in `commands.rs` are unaffected: `&state.chooser`
+    /// still deref-coerces to `&ChooserRegistry` exactly as before.
+    pub chooser: Arc<ChooserRegistry>,
+    /// Short-lived, single-use proof that `requestDevice()` was called from
+    /// a real user gesture — see `gesture.rs`'s module doc comment. Not
+    /// `Arc`-wrapped: unlike `chooser`, nothing needs a `'static` handle to
+    /// this independent of `WebUsbState` itself.
+    pub gesture_tokens: crate::gesture::GestureTokens,
 }
 
 impl WebUsbState {
     pub fn new(settings: Arc<SettingsStore>) -> Self {
-        Self { settings, sessions: SessionRegistry::new(), chooser: ChooserRegistry::new() }
+        Self {
+            settings,
+            sessions: SessionRegistry::new(),
+            chooser: Arc::new(ChooserRegistry::new()),
+            gesture_tokens: crate::gesture::GestureTokens::new(),
+        }
     }
 }

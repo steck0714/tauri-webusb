@@ -41,6 +41,33 @@
 //! this plugin's command handler even runs — see `README.md`'s "Trust
 //! model" section for how the two layers (Tauri's ACL, and this module's
 //! per-origin device grants) compose.
+//!
+//! ## What about a cross-origin `<iframe>` inside one webview?
+//!
+//! `webview.url()` answers for the whole webview — its top-level navigated
+//! URL — not "whichever frame happened to issue this particular call". If a
+//! page embedded a cross-origin `<iframe>` that could *itself* reach this
+//! plugin's commands, its calls would be misattributed to the top-level
+//! page's origin (and grants), the exact bug this module's design otherwise
+//! has no way to notice on its own. This is a real, formerly-true concern,
+//! not a hypothetical one this module simply assumed away: it was
+//! [CVE-2024-35222/GHSA-57fm-592m-34r7](https://github.com/tauri-apps/tauri/security/advisories/GHSA-57fm-592m-34r7),
+//! where Tauri's own IPC bridge *was* reachable from iframes (unintentionally,
+//! on macOS). Tauri's fix, in the affected 1.x/2.x releases, was to stop
+//! injecting the IPC bridge into iframes at all on every platform (Windows
+//! only still permits it for a *same*-origin iframe — which raises no
+//! attribution concern, since a same-origin iframe already shares that
+//! origin's grants legitimately) — a core-level guarantee this plugin's
+//! commands benefit from automatically, the same way every other Tauri
+//! command does, rather than something expressible in this module at all:
+//! there would be no `webview.url()` call to make in the first place for a
+//! frame that can't reach a command handler to begin with. This is why this
+//! crate's own `CHANGELOG.md` could say tauri-webusb "turns out not to need"
+//! the bespoke per-frame token scheme `frame_origin.py` built — it very
+//! nearly did, on one platform, for one release line. The practical upshot
+//! for anyone embedding this plugin: keep your `tauri` dependency reasonably
+//! current (any release after the May 2024 advisory above), the same way
+//! you'd want to for any other IPC-security fix upstream.
 
 use url::Url;
 

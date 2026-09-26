@@ -49,9 +49,10 @@
 //!   forward from v0.0.4b2 rather than from fox-webusb's older, simpler
 //!   hard-reject-at-64MiB/16MiB scheme.
 
+use crate::error::WebUsbError;
 use crate::models::{
-    AlternateInterfaceDescriptor, DeviceDescriptor, Direction, EndpointDescriptor, EndpointType,
-    UsbDeviceFilter,
+    AlternateInterfaceDescriptor, ControlRecipient, ControlRequestType, DeviceDescriptor,
+    Direction, EndpointDescriptor, EndpointType, UsbDeviceFilter,
 };
 
 // ================================================================
@@ -379,6 +380,494 @@ pub fn classify_endpoint(bm_attributes: u8, b_endpoint_address: u8) -> Option<(E
 pub fn is_isochronous_endpoint(endpoint: &EndpointDescriptor) -> bool {
     endpoint.endpoint_type == EndpointType::Isochronous
 }
+
+// ================================================================
+// 8) Interface-class resolution against the *active* configuration
+// ================================================================
+// Ported from `hardening.py`'s `interface_class_for()`. `bridge.rs`'s
+// `interface_alternates()` (a different, complementary helper) returns
+// *every* alternate setting for an interface number so a caller can make
+// its own decision; this instead resolves down to a single "the" class,
+// with two different meanings depending on whether the caller knows which
+// alternate setting is actually current.
+
+/// Resolves `interface_number`'s `bInterfaceClass` within the device's
+/// *active* configuration only — never a non-active one, since a
+/// multi-configuration device could coincidentally reuse the same
+/// interface number for something else entirely in a configuration it
+/// isn't currently running.
+///
+/// - `Some(alt)`: the class of the *exact* `(interface_number, alt)` pair,
+///   or `None` if no such alternate setting exists. For a caller that
+///   genuinely knows which alternate setting is (or is about to become)
+///   selected: `claim_interface` (alternate setting 0 — the only one a
+///   bare `claimInterface()` call ever activates, per spec) and
+///   `select_alternate_interface` (the specific alternate being switched
+///   to).
+/// - `None` (conservative/fail-safe mode): scans *every* alternate setting
+///   sharing this interface number. If any one of them is a protected
+///   class, returns that class — regardless of which one is actually
+///   selected right now — so `is_protected_interface_class` on the result
+///   is `true` even if the *current* alternate setting happens to be
+///   benign. Only when none of them are protected does it fall back to
+///   the first match's class. `resolve_control_transfer_target` below
+///   uses this mode for its `recipient == Interface` (and `class`
+///   request-type) checks: a raw control transfer's `index` carries no
+///   "currently selected alternate setting" concept at all — control
+///   transfers address endpoint 0, not a specific alternate setting — so
+///   there is no single correct alternate to check precisely, and
+///   treating any protected alternate as disqualifying is the fail-safe
+///   choice (see `security_report/VULNERABILITY_REPORT.md` finding No.1
+///   in the reference `pyside6-webusb` project, and this module's own
+///   tests below).
+pub fn interface_class_for(descriptor: &DeviceDescriptor, interface_number: u8, alternate_setting: Option<u8>) -> Option<u8> {
+    let active_value = descriptor.active_configuration_value?;
+    let active_cfg = descriptor.configurations.iter().find(|c| c.configuration_value == active_value)?;
+    let iface = active_cfg.interfaces.iter().find(|i| i.interface_number == interface_number)?;
+    match alternate_setting {
+        Some(alt) => iface.alternates.iter().find(|a| a.alternate_setting == alt).map(|a| a.interface_class),
+        None => match iface.alternates.iter().find(|a| is_protected_interface_class(a.interface_class)) {
+            Some(protected) => Some(protected.interface_class),
+            None => iface.alternates.first().map(|a| a.interface_class),
+        },
+    }
+}
+
+/// `(interfaceNumber, alternateSetting, interfaceClass)` for every
+/// alternate setting, on any interface, that declares an endpoint at this
+/// exact address (`bEndpointAddress` — direction bit included) within the
+/// device's *active* configuration. Used only by
+/// `resolve_control_transfer_target`'s `recipient == Endpoint` handling
+/// below; deliberately returns every match rather than the first, since
+/// that check needs to know whether *any* of them is a protected class,
+/// not just whichever happens to be findable first.
+fn interfaces_owning_endpoint_address(descriptor: &DeviceDescriptor, endpoint_address: u8) -> Vec<(u8, u8, u8)> {
+    let Some(active_value) = descriptor.active_configuration_value else { return Vec::new() };
+    let Some(active_cfg) = descriptor.configurations.iter().find(|c| c.configuration_value == active_value) else {
+        return Vec::new();
+    };
+    let mut owners = Vec::new();
+    for iface in &active_cfg.interfaces {
+        for alt in &iface.alternates {
+            let declares_it = alt.endpoints.iter().any(|ep| {
+                let direction_bit = if ep.direction == Direction::In { 0x80 } else { 0x00 };
+                (ep.endpoint_number | direction_bit) == endpoint_address
+            });
+            if declares_it {
+                owners.push((iface.interface_number, alt.alternate_setting, alt.interface_class));
+            }
+        }
+    }
+    owners
+}
+
+/// The standard (`bmRequestType` type `00`) request codes the WebUSB spec's
+/// "check the validity of the control transfer parameters" algorithm
+/// allows through `controlTransferIn`/`Out` at all: `GET_STATUS` (`0x00`),
+/// `GET_DESCRIPTOR` (`0x06`), `GET_CONFIGURATION` (`0x08`),
+/// `GET_INTERFACE` (`0x0A`), `SYNCH_FRAME` (`0x0C`). Every other standard
+/// request (`SET_ADDRESS`, `SET_CONFIGURATION`, `SET_INTERFACE`, ...) would
+/// let a page renegotiate device/interface state this plugin itself is
+/// separately tracking (`claimed`/`active_alternate`) out from under it, or
+/// simply has no legitimate role reachable through this API at all.
+pub fn is_allowed_standard_control_request(request: u8) -> bool {
+    matches!(request, 0x00 | 0x06 | 0x08 | 0x0A | 0x0C)
+}
+
+/// Ported from `bridge.py`'s `_control_transfer_validation_error()` — the
+/// part of the WebUSB spec's "check the validity of the control transfer
+/// parameters" algorithm that `nusb` itself does not perform.
+///
+/// `nusb`'s `Interface::endpoint()` (used for bulk/interrupt transfers — see
+/// `bridge.rs`'s `resolve_transfer_endpoint`) is naturally scoped to
+/// whichever specific claimed interface it's called on, because it looks up
+/// the requested endpoint address in *that interface's own* current
+/// descriptor. `Interface::control_in`/`control_out` have no equivalent
+/// scoping: they accept *any* `recipient`/`index`, submitted on endpoint 0,
+/// regardless of which claimed interface's handle happened to issue the
+/// call — on every platform this plugin targets except Windows' WinUSB,
+/// which only constrains the narrower `recipient == Interface` case (and
+/// only to "the index's low byte matches whichever interface you're
+/// calling through", not "matches a claimed, non-protected interface").
+///
+/// Without this check, a page could `claimInterface()` any single benign
+/// interface and then send a `class`/`vendor` control transfer with
+/// `recipient: 'interface'` or `'endpoint'` naming a *different*,
+/// unclaimed, protected interface (HID, Mass Storage, ...) — a complete
+/// bypass of `claimInterface()`'s own protected-class check, on every
+/// non-Windows platform. See `security_report/VULNERABILITY_REPORT.md`
+/// finding No.1 in the reference `pyside6-webusb` project this crate was
+/// ported from, and this module's own tests below for the exact scenario.
+///
+/// Returns:
+/// - `Ok(None)`: no interface-specific target. Safe to submit through
+///   *any* already-claimed interface's handle (`bridge.rs` picks one —
+///   see `any_claimed_interface`), or through `Device::control_in`/`_out`
+///   directly where `nusb` offers it. This is the outcome for
+///   `recipient == Device` or `Other`, unless `requestType == "class"`
+///   (checked regardless of recipient, matching `bridge.py`).
+/// - `Ok(Some(interface_number))`: safe to submit, and specifically
+///   through *this* claimed interface's own handle — matters for
+///   `recipient == Interface` on Windows (see `bridge.rs`'s call site);
+///   harmless to also do on every other platform.
+/// - `Err(_)`: reject the transfer outright, with the exact
+///   `DOMException` kind `bridge.py`'s own version of this check used for
+///   the equivalent case.
+///
+/// `is_claimed`/`active_alternate_of` are closures rather than a
+/// `HashMap`/`HashSet` reference so this stays exercisable with trivial
+/// hand-built test doubles (see below) without pulling `bridge.rs`'s
+/// `nusb`-backed `OpenSession` shape into this module at all —
+/// `active_alternate_of` should return `0` for an interface it has no
+/// entry for, matching `bridge.py`'s own `alt_settings.get(iface_num, 0)`
+/// (alternate setting 0 is always the spec-defined default before
+/// `selectAlternateInterface()` is ever called).
+pub fn resolve_control_transfer_target(
+    descriptor: &DeviceDescriptor,
+    is_claimed: impl Fn(u8) -> bool,
+    active_alternate_of: impl Fn(u8) -> u8,
+    request_type: ControlRequestType,
+    recipient: ControlRecipient,
+    request: u8,
+    direction_in: bool,
+    index: u16,
+) -> Result<Option<u8>, WebUsbError> {
+    if request_type == ControlRequestType::Standard {
+        if !direction_in {
+            return Err(WebUsbError::security("standard requests are not allowed for controlTransferOut"));
+        }
+        if !is_allowed_standard_control_request(request) {
+            return Err(WebUsbError::security(format!(
+                "standard request {request:#04x} is not one of the requests allowed by the WebUSB \
+                 spec (GET_STATUS/GET_DESCRIPTOR/GET_CONFIGURATION/GET_INTERFACE/SYNCH_FRAME)"
+            )));
+        }
+    }
+
+    // Checked regardless of `recipient` — a `class` request whose
+    // `recipient` is `Device`/`Other` has no interface-specific target at
+    // all (falls through to `Ok(None)` below), but one whose `index`
+    // *does* name a protected interface must still be rejected even if
+    // `recipient` technically says otherwise, matching `bridge.py` exactly.
+    if request_type == ControlRequestType::Class {
+        let iface_number = (index & 0xFF) as u8;
+        if let Some(iface_class) = interface_class_for(descriptor, iface_number, None) {
+            if is_protected_interface_class(iface_class) {
+                return Err(WebUsbError::security(format!(
+                    "interface {iface_number} is class {iface_class:#04x} ('{}'), a protected interface \
+                     class, and cannot receive class-specific control requests",
+                    protected_class_name(iface_class)
+                )));
+            }
+        }
+    }
+
+    match recipient {
+        ControlRecipient::Interface => {
+            let iface_number = (index & 0xFF) as u8;
+            let iface_class = interface_class_for(descriptor, iface_number, None)
+                .ok_or_else(|| WebUsbError::not_found(format!("interface {iface_number} was not found on this device")))?;
+            if is_protected_interface_class(iface_class) {
+                return Err(WebUsbError::security(format!(
+                    "interface {iface_number} is class {iface_class:#04x} ('{}'), a protected interface class",
+                    protected_class_name(iface_class)
+                )));
+            }
+            if !is_claimed(iface_number) {
+                return Err(WebUsbError::invalid_state(format!("interface {iface_number} has not been claimed")));
+            }
+            Ok(Some(iface_number))
+        }
+        ControlRecipient::Endpoint => {
+            let endpoint_address = (index & 0xFF) as u8;
+            let owners = interfaces_owning_endpoint_address(descriptor, endpoint_address);
+            if owners.is_empty() {
+                return Err(WebUsbError::not_found(format!("endpoint {endpoint_address:#04x} was not found on this device")));
+            }
+            // 🛡️ Fail-safe, same reasoning as the `None`-mode of
+            // `interface_class_for` above: if *any* alternate setting that
+            // declares this endpoint address is a protected class, reject
+            // outright, even if the one currently selected is not.
+            if let Some(&(_, _, protected_class)) = owners.iter().find(|&&(_, _, cls)| is_protected_interface_class(cls)) {
+                return Err(WebUsbError::security(format!(
+                    "endpoint {endpoint_address:#04x} belongs to interface class {protected_class:#04x} \
+                     ('{}'), a protected interface class",
+                    protected_class_name(protected_class)
+                )));
+            }
+            let owner_number = owners
+                .iter()
+                .find(|&&(iface_num, alt_num, _)| active_alternate_of(iface_num) == alt_num)
+                .or_else(|| owners.first())
+                .map(|&(iface_num, _, _)| iface_num)
+                .expect("owners is non-empty, checked above");
+            if !is_claimed(owner_number) {
+                return Err(WebUsbError::invalid_state(format!(
+                    "interface {owner_number} owning endpoint {endpoint_address:#04x} has not been claimed"
+                )));
+            }
+            Ok(Some(owner_number))
+        }
+        ControlRecipient::Device | ControlRecipient::Other => Ok(None),
+    }
+}
+
+/// Real Chrome's `USBDevice::EnsureEndpointAvailable()` (confirmed against
+/// `third_party/blink/renderer/modules/webusb/usb_device.cc`) rejects any
+/// `endpointNumber` outside `1..=15` with `IndexSizeError` before even
+/// looking for the endpoint: `0` is reserved for control transfers (not
+/// reachable through `transferIn`/`Out`/`clearHalt` at all — see
+/// `USBControlTransferParameters` instead), and only 4 bits of endpoint
+/// number exist in the first place.
+pub fn is_valid_transfer_endpoint_number(endpoint_number: u8) -> bool {
+    (1..=15).contains(&endpoint_number)
+}
+
+/// Ported from `bridge.py`'s `_endpoint_available_or_error()` (itself
+/// citing real Chrome's `USBDevice::EnsureEndpointAvailable()`): the
+/// precondition `transferIn`/`Out` and `clearHalt` must all check before
+/// touching a device at all — the target endpoint must belong to an
+/// interface that is both currently claimed *and* currently sitting at the
+/// one alternate setting that actually declares it.
+///
+/// Without this, a page could read/write a protected (HID, Mass Storage,
+/// ...) interface's bulk/interrupt endpoints having never called
+/// `claimInterface()` at all — a complete bypass of its protected-class
+/// check for every operation *except* control transfers, which is a
+/// different, narrower bypass already covered by
+/// `resolve_control_transfer_target` above. See
+/// `security_report/VULNERABILITY_REPORT.md` finding No.1 in the reference
+/// `pyside6-webusb` project (the same finding as
+/// `resolve_control_transfer_target`'s doc comment, extended to a second,
+/// independent code path both predecessors originally missed there too).
+///
+/// Deliberately searches *only* claimed interfaces at their current
+/// alternate setting and folds every failure into the same `NotFoundError`
+/// — unlike `resolve_control_transfer_target`'s endpoint-recipient branch,
+/// this does not distinguish "no such endpoint anywhere on the device"
+/// from "that endpoint exists, but on an interface you haven't claimed (or
+/// haven't switched to the right alternate setting for)": both look
+/// identical to the caller, matching `bridge.py`'s own choice here (the two
+/// checks were independently hardened at different points in that
+/// project's history and ended up with two different, both intentional,
+/// error-shape choices for a similar-looking scenario — see that
+/// function's own doc comment).
+///
+/// Returns the owning interface number and a clone of its endpoint
+/// descriptor (type, packet size) together, resolved from the exact same
+/// (interface, alternate setting) pair, so a caller can never end up using
+/// one interface's claim to submit a transfer shaped by a *different*
+/// interface's — possibly different — descriptor for the same nominal
+/// endpoint number.
+pub fn resolve_transfer_endpoint_owner(
+    descriptor: &DeviceDescriptor,
+    is_claimed: impl Fn(u8) -> bool,
+    active_alternate_of: impl Fn(u8) -> u8,
+    endpoint_address: u8,
+) -> Result<(u8, EndpointDescriptor), WebUsbError> {
+    let not_found = || {
+        WebUsbError::not_found(format!(
+            "endpoint {endpoint_address:#04x} is not part of a claimed and selected alternate interface"
+        ))
+    };
+    // Matches `bridge.py` distinguishing "no configuration selected at
+    // all" (`InvalidStateError`) from "that endpoint isn't reachable given
+    // the current claims/alternate settings" (`NotFoundError`) below —
+    // different `DOMException` names for two genuinely different
+    // situations, even though both ultimately mean "this transfer can't
+    // proceed".
+    let Some(active_value) = descriptor.active_configuration_value else {
+        return Err(WebUsbError::invalid_state("the device must have a configuration selected"));
+    };
+    let Some(active_cfg) = descriptor.configurations.iter().find(|c| c.configuration_value == active_value) else {
+        return Err(WebUsbError::invalid_state("the device must have a configuration selected"));
+    };
+    for iface in &active_cfg.interfaces {
+        if !is_claimed(iface.interface_number) {
+            continue;
+        }
+        let current_alt = active_alternate_of(iface.interface_number);
+        let Some(alt) = iface.alternates.iter().find(|a| a.alternate_setting == current_alt) else { continue };
+        let found = alt.endpoints.iter().find(|ep| {
+            let direction_bit = if ep.direction == Direction::In { 0x80 } else { 0x00 };
+            (ep.endpoint_number | direction_bit) == endpoint_address
+        });
+        if let Some(ep) = found {
+            return Ok((iface.interface_number, ep.clone()));
+        }
+    }
+    Err(not_found())
+}
+
+// ================================================================
+// 9) Device-supplied string sanitization
+// ================================================================
+// Ported from `hardening.py`'s `sanitize_device_string()`, added in
+// pyside6-webusb v0.0.4b3 as the fix for
+// `security_report/VULNERABILITY_REPORT.md` finding No.3: manufacturer/
+// product/serial/configuration/interface-name strings come straight from
+// the connected USB device's own string descriptors — entirely under a
+// potentially hostile device's control, and more so than an error message
+// (which at least passes through this implementation's own formatting
+// first — see `error.rs`'s `sanitize_message`). Two independent attacks
+// this closes:
+//
+//   - Bidi-override spoofing: U+202A-U+202E (LRE/RLE/PDF/LRO/RLO) and
+//     U+2066-U+2069 (LRI/RLI/FSI/PDI) can reorder how surrounding
+//     characters *display* without changing the underlying text — the same
+//     family of trick used to disguise filenames (e.g. making "cod.exe"
+//     display as "exe.doc"), applicable here to a device name shown in the
+//     chooser window (`chooser-ui/index.html`) or any UI a consuming app
+//     builds from `getDevices()`/`requestDevice()`'s result.
+//   - Unbounded length: nothing before this stopped a device from
+//     returning a multi-megabyte string descriptor, which would otherwise
+//     flow straight into `DeviceDescriptor`, then JSON, then a UI.
+//
+// Unlike pyside6-webusb's chooser (a native `QLabel` that separately needed
+// `setTextFormat(Qt.TextFormat.PlainText)` to stop interpreting a device
+// string as rich text/HTML at all), `chooser-ui/index.html` here already
+// only ever inserts these strings via `Node.textContent` — never
+// `innerHTML` — so there is no analogous markup-injection angle to close.
+// Sanitizing here is still worthwhile in its own right: it's the *one*
+// place that benefits every consumer (the chooser window, any UI the
+// embedding app itself builds from `USBDevice`/`USBConfiguration`/
+// `USBInterface`, any log line), matching `hardening.py`'s own reasoning
+// for sanitizing at the source rather than only at whichever one call site
+// happened to prompt the finding.
+
+/// Same nine code points `hardening.py` strips: U+202A-U+202E (bidi
+/// override/embedding) and U+2066-U+2069 (bidi isolate).
+const BIDI_OVERRIDE_CHARS: [char; 9] =
+    ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}'];
+
+/// Conservative ceiling, well past any real USB string descriptor's
+/// practical length (a one-byte `bLength` caps the underlying UTF-16LE
+/// descriptor at 253 bytes of text to begin with) — this exists for
+/// devices that don't honor that, not for any legitimate one. Matches
+/// `hardening.py`'s `_DEVICE_STRING_MAX_LEN`.
+pub const DEVICE_STRING_MAX_LEN: usize = 255;
+
+/// Sanitizes one USB-device-supplied string (`manufacturerName`,
+/// `productName`, `serialNumber`, `configurationName`, `interfaceName`) for
+/// safe display and JSON transport: strips every C0 (U+0000-U+001F) and C1
+/// (U+007F-U+009F) control character, strips the bidi-override/isolate
+/// characters above, then truncates to `max_len` *characters* (not UTF-8
+/// bytes) with a trailing `…` if anything was actually cut.
+pub fn sanitize_device_string(value: &str, max_len: usize) -> String {
+    let cleaned: String = value
+        .chars()
+        .filter(|&ch| !matches!(ch, '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}'))
+        .filter(|ch| !BIDI_OVERRIDE_CHARS.contains(ch))
+        .collect();
+    if cleaned.chars().count() > max_len {
+        let mut truncated: String = cleaned.chars().take(max_len).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        cleaned
+    }
+}
+
+/// Convenience wrapper for the common `Option<String>` shape every actual
+/// device-supplied name field has: `None` means the device has no such
+/// descriptor at all (a meaningful, legitimate value — iManufacturer/etc.
+/// being `0` — not something to sanitize into an empty string), so it
+/// passes straight through.
+pub fn sanitize_device_string_opt(value: Option<String>) -> Option<String> {
+    value.map(|v| sanitize_device_string(&v, DEVICE_STRING_MAX_LEN))
+}
+
+// ================================================================
+// 10) Request-shape bounds (resource-exhaustion defense-in-depth)
+// ================================================================
+// Ported from pyside6-webusb v0.0.5.post5's "hardened options and base64
+// payload boundaries": every one of these bounds a worst-case allocation
+// or iteration count *before* doing it, rather than only checking the
+// result afterward. None of these are WebUSB spec requirements — Chrome
+// itself has no documented limit on filter-array length, for instance —
+// they exist purely so a single malicious/buggy call can't force this
+// process into an unbounded allocation, matching section 5's
+// `HOST_SAFETY_MAX_TRANSFER_LENGTH` in spirit.
+
+/// `requestDevice()`'s `filters`/`exclusionFilters` are each capped at this
+/// many entries. Real pages pass a handful (single digits); this is
+/// generous headroom over that, not a realistic legitimate value — without
+/// *some* cap, `commands.rs` would happily deserialize (and then
+/// `hardening::device_matches_any_usb_filter` would iterate) an
+/// attacker-sized array on every call to `getDevices()`/`requestDevice()`.
+pub const MAX_DEVICE_FILTERS: usize = 64;
+
+/// `isochronousTransferIn`/`Out`'s `packetLengths` array is capped at this
+/// many entries. Real USB isochronous scheduling tops out at a few hundred
+/// packets per transfer at most (one microframe per 125µs/1ms, batched);
+/// this is generous headroom over that. Bounding the *count* matters
+/// independently of bounding the *sum* (already enforced via
+/// `ISOCHRONOUS_TRANSFER_MAX_TOTAL_LENGTH`) — a `Vec` of a million `0`-byte
+/// packet lengths sums to zero but still costs real memory and iteration
+/// time to build and walk.
+pub const MAX_ISOCHRONOUS_PACKETS: usize = 4096;
+
+/// The longest a base64-encoded `transferOut`/`controlTransferOut`/
+/// `isochronousTransferOut` payload string is allowed to be, *before*
+/// attempting to decode it. Base64 inflates size by 4/3; checking the
+/// *encoded* string's length against this bound (rather than only checking
+/// the *decoded* byte count afterward, against
+/// `HOST_SAFETY_MAX_TRANSFER_LENGTH`) means a call carrying an
+/// attacker-sized base64 string gets rejected before this process commits
+/// to allocating and decoding it at all. The `+ 4` covers base64's own
+/// padding characters at the smallest possible margin; the real slack here
+/// is `/ 3 * 4` rounding generously.
+pub const MAX_BASE64_PAYLOAD_CHARS: usize = ((HOST_SAFETY_MAX_TRANSFER_LENGTH as usize) / 3) * 4 + 4;
+
+// ================================================================
+// 11) Gesture-token policy (requestDevice() user-activation proof)
+// ================================================================
+// Ported from `bridge.py`'s `mintGestureToken()`/`_consume_gesture_token()`,
+// added in pyside6-webusb v0.0.4b3 as the fix for
+// `security_report/VULNERABILITY_REPORT.md` finding No.2's user-gesture
+// half (the filter-validity half is `is_valid_usb_device_filter` above,
+// already enforced server-side in this crate from the start — see
+// `commands.rs`). The actual token cache lives in `gesture.rs`, which
+// needs `tokio::sync::Mutex` and `std::time::Instant` and so doesn't belong
+// in this dependency-free module — these are just the tunable policy
+// constants, kept here alongside every other security-relevant constant in
+// the crate rather than buried in the module that happens to enforce them.
+//
+// `guest-js/src/polyfill.ts`'s `requestDevice()` already checks
+// `navigator.userActivation.isActive` before calling into Rust at all —
+// but that check runs in the *page's own JS context*, which any other
+// script on the same page (or a direct `invoke("plugin:webusb|request_device",
+// ...)` call bypassing the polyfill entirely — Tauri's IPC bridge is
+// reachable from any script in a webview holding the `webusb:default`
+// capability, not gated behind importing this package) can simply skip.
+// `mint_gesture_token` (a separate command, in the same permission set —
+// see `permissions/default.toml`) is what `polyfill.ts` calls *at* the
+// moment it confirms a real user activation is active; `request_device`
+// then requires and consumes that exact token server-side before ever
+// showing the chooser window. This raises the bar substantially without
+// being a perfect guarantee against a sufficiently determined scripted
+// attacker that also mints its own token via the same bypass — matching
+// `bridge.py`'s own documented caveat for the identical limitation.
+pub const GESTURE_TOKEN_TTL_SECS: u64 = 5;
+pub const GESTURE_TOKEN_CACHE_CAP: usize = 64;
+
+// ================================================================
+// 12) Per-origin open-handle cap (security_report finding No.6)
+// ================================================================
+// Ported from `bridge.py`'s `_MAX_OPEN_HANDLES_PER_ORIGIN`, added in
+// pyside6-webusb v0.0.4b3: an ordinary page holding one legitimate grant
+// could otherwise grow this plugin's session table without bound just by
+// calling `device.open()` in a loop and never closing the results — no
+// bypass of any kind needed. That consumes memory in the *host
+// application's own process* (this plugin lives in-process with the
+// consuming Tauri app, unlike a browser tab's separately-sandboxed
+// renderer), so it isn't bounded by anything else already in place.
+/// Generous headroom over any legitimate use `bridge.py`'s own audit fix
+/// identified — see `bridge.rs`'s `open_device` for the LRU-eviction
+/// policy this backs (opening past the cap evicts that origin's *oldest*
+/// still-open handle rather than failing the new `open()` call, matching
+/// `bridge.py` exactly).
+pub const MAX_OPEN_HANDLES_PER_ORIGIN: usize = 64;
 
 #[cfg(test)]
 mod tests {
@@ -720,5 +1209,341 @@ mod tests {
         let bulk = EndpointDescriptor { endpoint_number: 1, direction: Direction::In, endpoint_type: EndpointType::Bulk, packet_size: 512 };
         assert!(is_isochronous_endpoint(&iso));
         assert!(!is_isochronous_endpoint(&bulk));
+    }
+
+    // ---- test fixtures: a composite device shaped for the alternate-setting
+    // class confusion scenario (security_report/VULNERABILITY_REPORT.md No.1)
+    // -- interface 0's alternate setting 0 is innocuous vendor-specific with a
+    // bulk IN endpoint at 0x81; alternate setting 1 of that *same* interface
+    // number is HID (protected) with an interrupt IN endpoint at 0x82.
+    // Interface 5 exists purely as an "another benign, claimable interface"
+    // control. ----
+
+    fn alt(alternate_setting: u8, class: u8, protected: bool, endpoints: Vec<EndpointDescriptor>) -> AlternateInterfaceDescriptor {
+        AlternateInterfaceDescriptor {
+            alternate_setting,
+            interface_class: class,
+            interface_subclass: 0,
+            interface_protocol: 0,
+            interface_protected: protected,
+            interface_name: None,
+            endpoints,
+        }
+    }
+
+    fn ep(number: u8, direction: Direction, endpoint_type: EndpointType) -> EndpointDescriptor {
+        EndpointDescriptor { endpoint_number: number, direction, endpoint_type, packet_size: 64 }
+    }
+
+    fn confused_composite_device() -> DeviceDescriptor {
+        DeviceDescriptor {
+            vendor_id: 0x1234,
+            product_id: 0x5678,
+            manufacturer_name: None,
+            product_name: None,
+            serial_number: None,
+            device_class: 0,
+            device_subclass: 0,
+            device_protocol: 0,
+            usb_version_major: 2,
+            usb_version_minor: 0,
+            usb_version_subminor: 0,
+            device_version_major: 1,
+            device_version_minor: 0,
+            device_version_subminor: 0,
+            active_configuration_value: Some(1),
+            connect_count: None,
+            configurations: vec![ConfigurationDescriptor {
+                configuration_value: 1,
+                configuration_name: None,
+                interfaces: vec![
+                    InterfaceDescriptor {
+                        interface_number: 0,
+                        alternates: vec![
+                            alt(0, 0xFF, false, vec![ep(1, Direction::In, EndpointType::Bulk)]), // 0x81, benign
+                            alt(1, 0x03, true, vec![ep(2, Direction::In, EndpointType::Interrupt)]), // 0x82, HID
+                        ],
+                    },
+                    InterfaceDescriptor { interface_number: 5, alternates: vec![alt(0, 0xFF, false, vec![])] },
+                ],
+            }],
+        }
+    }
+
+    // ---- interface_class_for ----
+
+    #[test]
+    fn interface_class_for_specific_alt_returns_that_alts_class_only() {
+        let d = confused_composite_device();
+        assert_eq!(interface_class_for(&d, 0, Some(0)), Some(0xFF));
+        assert_eq!(interface_class_for(&d, 0, Some(1)), Some(0x03));
+    }
+
+    #[test]
+    fn interface_class_for_specific_nonexistent_alt_is_none() {
+        let d = confused_composite_device();
+        assert_eq!(interface_class_for(&d, 0, Some(9)), None);
+    }
+
+    #[test]
+    fn interface_class_for_none_mode_is_conservative_about_any_protected_alt() {
+        let d = confused_composite_device();
+        // Alternate setting 0 alone is benign, but alternate setting 1 of the
+        // *same* interface number is HID -- fail-safe mode must surface that,
+        // not whichever alternate happens to be first.
+        assert_eq!(interface_class_for(&d, 0, None), Some(0x03));
+    }
+
+    #[test]
+    fn interface_class_for_none_mode_falls_back_to_first_when_none_protected() {
+        let d = confused_composite_device();
+        assert_eq!(interface_class_for(&d, 5, None), Some(0xFF));
+    }
+
+    #[test]
+    fn interface_class_for_nonexistent_interface_is_none() {
+        let d = confused_composite_device();
+        assert_eq!(interface_class_for(&d, 99, None), None);
+    }
+
+    // ---- resolve_control_transfer_target: the actual security_report No.1 scenario ----
+
+    #[test]
+    fn control_transfer_endpoint_recipient_rejects_the_hidden_hid_endpoint() {
+        let d = confused_composite_device();
+        // Interface 0 is claimed and currently sitting at alternate setting 0
+        // (the benign one) -- exactly the state after a legitimate
+        // `claimInterface(0)` with no `selectAlternateInterface()` call.
+        let is_claimed = |n: u8| n == 0;
+        let active_alt = |n: u8| if n == 0 { 0 } else { 0 };
+        let err = resolve_control_transfer_target(
+            &d, is_claimed, active_alt, ControlRequestType::Vendor, ControlRecipient::Endpoint, 0x01, true, 0x82,
+        )
+        .expect_err("endpoint 0x82 only exists under HID alternate setting 1 and must be rejected");
+        assert_eq!(err.kind, crate::error::ErrorKind::Security);
+        assert!(err.message.contains("0x82"), "message should name the endpoint: {}", err.message);
+    }
+
+    #[test]
+    fn control_transfer_endpoint_recipient_allows_the_claimed_current_alt_endpoint() {
+        let d = confused_composite_device();
+        let is_claimed = |n: u8| n == 0;
+        let active_alt = |_: u8| 0;
+        let target = resolve_control_transfer_target(
+            &d, is_claimed, active_alt, ControlRequestType::Vendor, ControlRecipient::Endpoint, 0x01, true, 0x81,
+        )
+        .expect("endpoint 0x81 belongs to the claimed, currently-selected, non-protected alternate 0");
+        assert_eq!(target, Some(0));
+    }
+
+    #[test]
+    fn control_transfer_interface_recipient_rejects_interface_with_any_protected_alt() {
+        let d = confused_composite_device();
+        let is_claimed = |n: u8| n == 0;
+        let active_alt = |_: u8| 0;
+        // Targeting interface 0 directly (recipient: interface) must fail
+        // even though alternate setting 0 -- the one actually selected -- is
+        // itself benign, because alternate setting 1 is HID. This is the
+        // conservative (fail-safe) half of the fix: claimInterface() itself
+        // already refuses to claim interface 0 at all in tauri-webusb's own
+        // `claim_interface` (see bridge.rs), so this case would only be
+        // reachable at all through some other implementation's more
+        // permissive claim policy -- exercised here purely to confirm this
+        // function's own check doesn't depend on that.
+        let err = resolve_control_transfer_target(
+            &d, is_claimed, active_alt, ControlRequestType::Vendor, ControlRecipient::Interface, 0x01, true, 0,
+        )
+        .expect_err("interface 0 has a protected alternate setting");
+        assert_eq!(err.kind, crate::error::ErrorKind::Security);
+    }
+
+    #[test]
+    fn control_transfer_interface_recipient_rejects_unclaimed_interface() {
+        let d = confused_composite_device();
+        let is_claimed = |_: u8| false; // nothing claimed at all
+        let active_alt = |_: u8| 0;
+        let err = resolve_control_transfer_target(
+            &d, is_claimed, active_alt, ControlRequestType::Vendor, ControlRecipient::Interface, 0x01, true, 5,
+        )
+        .expect_err("interface 5 exists and is benign but was never claimed");
+        assert_eq!(err.kind, crate::error::ErrorKind::InvalidState);
+    }
+
+    #[test]
+    fn control_transfer_interface_recipient_reports_nonexistent_interface_as_not_found() {
+        let d = confused_composite_device();
+        let err = resolve_control_transfer_target(
+            &d, |_| true, |_| 0, ControlRequestType::Vendor, ControlRecipient::Interface, 0x01, true, 42,
+        )
+        .expect_err("interface 42 does not exist on this device");
+        assert_eq!(err.kind, crate::error::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn control_transfer_endpoint_recipient_reports_nonexistent_endpoint_as_not_found() {
+        let d = confused_composite_device();
+        let err = resolve_control_transfer_target(
+            &d, |_| true, |_| 0, ControlRequestType::Vendor, ControlRecipient::Endpoint, 0x01, true, 0xEE,
+        )
+        .expect_err("no endpoint at address 0xEE exists anywhere on this device");
+        assert_eq!(err.kind, crate::error::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn control_transfer_class_request_is_checked_regardless_of_recipient() {
+        let d = confused_composite_device();
+        // recipient == device, but requestType == class and index still
+        // names the protected interface -- bridge.py checks this
+        // unconditionally, independent of what `recipient` itself says.
+        let err = resolve_control_transfer_target(
+            &d, |_| true, |n| if n == 0 { 1 } else { 0 }, ControlRequestType::Class, ControlRecipient::Device, 0x01, true, 0,
+        )
+        .expect_err("index names interface 0, currently at the HID alternate setting");
+        assert_eq!(err.kind, crate::error::ErrorKind::Security);
+    }
+
+    #[test]
+    fn control_transfer_device_recipient_vendor_request_has_no_interface_check() {
+        let d = confused_composite_device();
+        let target = resolve_control_transfer_target(
+            &d, |_| false, |_| 0, ControlRequestType::Vendor, ControlRecipient::Device, 0x01, true, 0,
+        )
+        .expect("device-recipient vendor requests never need an interface to be claimed at all");
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn control_transfer_standard_out_is_always_rejected() {
+        let d = confused_composite_device();
+        let err = resolve_control_transfer_target(
+            &d, |_| true, |_| 0, ControlRequestType::Standard, ControlRecipient::Device, 0x06, false, 0,
+        )
+        .expect_err("standard requests are never allowed for controlTransferOut");
+        assert_eq!(err.kind, crate::error::ErrorKind::Security);
+    }
+
+    #[test]
+    fn control_transfer_standard_in_rejects_requests_outside_the_allowed_set() {
+        let d = confused_composite_device();
+        let err = resolve_control_transfer_target(
+            &d, |_| true, |_| 0, ControlRequestType::Standard, ControlRecipient::Device, 0x09, true, 0,
+        )
+        .expect_err("SET_CONFIGURATION (0x09) is not in the WebUSB-allowed standard request set");
+        assert_eq!(err.kind, crate::error::ErrorKind::Security);
+    }
+
+    #[test]
+    fn control_transfer_standard_in_allows_get_descriptor() {
+        let d = confused_composite_device();
+        let target = resolve_control_transfer_target(
+            &d, |_| true, |_| 0, ControlRequestType::Standard, ControlRecipient::Device, 0x06, true, 0,
+        )
+        .expect("GET_DESCRIPTOR is allowed");
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn is_allowed_standard_control_request_matches_exactly_the_five_spec_requests() {
+        for allowed in [0x00, 0x06, 0x08, 0x0A, 0x0C] {
+            assert!(is_allowed_standard_control_request(allowed), "{allowed:#04x} should be allowed");
+        }
+        for disallowed in [0x01, 0x03, 0x05, 0x07, 0x09, 0x0B, 0xFF] {
+            assert!(!is_allowed_standard_control_request(disallowed), "{disallowed:#04x} should not be allowed");
+        }
+    }
+
+    // ---- resolve_transfer_endpoint_owner / is_valid_transfer_endpoint_number ----
+
+    #[test]
+    fn is_valid_transfer_endpoint_number_excludes_zero_and_anything_above_fifteen() {
+        assert!(!is_valid_transfer_endpoint_number(0));
+        for n in 1..=15u8 {
+            assert!(is_valid_transfer_endpoint_number(n));
+        }
+        assert!(!is_valid_transfer_endpoint_number(16));
+        assert!(!is_valid_transfer_endpoint_number(255));
+    }
+
+    #[test]
+    fn resolve_transfer_endpoint_owner_rejects_endpoint_on_an_unclaimed_interface() {
+        let d = confused_composite_device();
+        // Endpoint 0x81 exists (on interface 0's benign alternate setting
+        // 0), but nothing is claimed at all -- this is the bulk/interrupt-
+        // transfer equivalent of the No.1 bypass: without this check, a
+        // page could read/write it having never called claimInterface().
+        let err = resolve_transfer_endpoint_owner(&d, |_| false, |_| 0, 0x81).expect_err("interface 0 was never claimed");
+        assert_eq!(err.kind, crate::error::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn resolve_transfer_endpoint_owner_rejects_endpoint_on_a_non_current_alternate_setting() {
+        let d = confused_composite_device();
+        // Interface 0 is claimed, but currently sitting at alternate
+        // setting 1 (HID) rather than 0 -- endpoint 0x81 only exists under
+        // alternate setting 0, so it must not be reachable right now even
+        // though interface 0 itself is claimed.
+        let err = resolve_transfer_endpoint_owner(&d, |n| n == 0, |_| 1, 0x81).expect_err("0x81 belongs to alternate setting 0, not the current alternate setting 1");
+        assert_eq!(err.kind, crate::error::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn resolve_transfer_endpoint_owner_accepts_the_claimed_current_alt_endpoint() {
+        let d = confused_composite_device();
+        let (owner, ep) = resolve_transfer_endpoint_owner(&d, |n| n == 0, |_| 0, 0x81).expect("0x81 belongs to claimed interface 0's current alternate setting 0");
+        assert_eq!(owner, 0);
+        assert_eq!(ep.endpoint_number, 1);
+        assert_eq!(ep.direction, Direction::In);
+    }
+
+    #[test]
+    fn resolve_transfer_endpoint_owner_reports_nonexistent_address_as_not_found() {
+        let d = confused_composite_device();
+        let err = resolve_transfer_endpoint_owner(&d, |_| true, |_| 0, 0xEE).expect_err("no endpoint at 0xEE exists anywhere");
+        assert_eq!(err.kind, crate::error::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn resolve_transfer_endpoint_owner_requires_an_active_configuration() {
+        let mut d = confused_composite_device();
+        d.active_configuration_value = None;
+        let err = resolve_transfer_endpoint_owner(&d, |_| true, |_| 0, 0x81).expect_err("no configuration is active");
+        assert_eq!(err.kind, crate::error::ErrorKind::InvalidState);
+    }
+
+    // ---- sanitize_device_string ----
+
+    #[test]
+    fn sanitize_device_string_strips_c0_and_c1_control_characters() {
+        assert_eq!(sanitize_device_string("a\u{0000}b\u{001f}c\u{007f}d\u{009e}e", 255), "abcde");
+    }
+
+    #[test]
+    fn sanitize_device_string_strips_bidi_override_characters() {
+        // U+202E RIGHT-TO-LEFT OVERRIDE embedded in an otherwise-plain name.
+        let spoofed = format!("cod{}exe", '\u{202E}');
+        assert_eq!(sanitize_device_string(&spoofed, 255), "codexe");
+    }
+
+    #[test]
+    fn sanitize_device_string_leaves_ordinary_text_untouched() {
+        assert_eq!(sanitize_device_string("Acme Widget Pro", 255), "Acme Widget Pro");
+    }
+
+    #[test]
+    fn sanitize_device_string_truncates_with_ellipsis() {
+        let long = "x".repeat(300);
+        let got = sanitize_device_string(&long, 255);
+        assert_eq!(got.chars().count(), 256); // 255 + the ellipsis character
+        assert!(got.ends_with('…'));
+    }
+
+    #[test]
+    fn sanitize_device_string_opt_passes_none_through_untouched() {
+        assert_eq!(sanitize_device_string_opt(None), None);
+    }
+
+    #[test]
+    fn sanitize_device_string_opt_sanitizes_the_inner_string() {
+        assert_eq!(sanitize_device_string_opt(Some("a\x00b".to_string())), Some("ab".to_string()));
     }
 }

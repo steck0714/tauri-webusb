@@ -39,6 +39,7 @@ use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, Direction
 use nusb::{Device, DeviceInfo, Interface};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -73,9 +74,14 @@ fn descriptor_from_device_info(info: &DeviceInfo) -> DeviceDescriptor {
     DeviceDescriptor {
         vendor_id: info.vendor_id(),
         product_id: info.product_id(),
-        manufacturer_name: info.manufacturer_string().map(str::to_string),
-        product_name: info.product_string().map(str::to_string),
-        serial_number: info.serial_number().map(str::to_string),
+        // 🛡️ security_report/VULNERABILITY_REPORT.md finding No.3 (see
+        // `hardening::sanitize_device_string`'s doc comment): these three
+        // strings come straight from the connected device's own string
+        // descriptors, sanitized here — once, at the source — rather than
+        // at whichever call site happens to display them.
+        manufacturer_name: hardening::sanitize_device_string_opt(info.manufacturer_string().map(str::to_string)),
+        product_name: hardening::sanitize_device_string_opt(info.product_string().map(str::to_string)),
+        serial_number: hardening::sanitize_device_string_opt(info.serial_number().map(str::to_string)),
         device_class: info.class(),
         device_subclass: info.subclass(),
         device_protocol: info.protocol(),
@@ -121,7 +127,7 @@ async fn descriptor_from_open_device(device: &Device, base: DeviceDescriptor) ->
     // *active*, it is purely descriptor reading.
     for cfg in device.configurations() {
         let configuration_value = cfg.configuration_value();
-        let configuration_name = cfg.description_string().map(str::to_string);
+        let configuration_name = hardening::sanitize_device_string_opt(cfg.description_string().map(str::to_string));
 
         let mut interfaces_by_number: HashMap<u8, Vec<AlternateInterfaceDescriptor>> = HashMap::new();
         for alt in cfg.interface_alt_settings() {
@@ -132,17 +138,32 @@ async fn descriptor_from_open_device(device: &Device, base: DeviceDescriptor) ->
 
             let mut endpoints = Vec::new();
             for ep in alt.endpoints() {
+                // 🔧 Corrected against the real `nusb` 0.2.7 source
+                // (`descriptors.rs`): `EndpointDescriptor::transfer_type()`
+                // returns `nusb::descriptors::TransferType`, a plain data
+                // enum — *not* `nusb::transfer::EndpointType`, which is a
+                // type-level marker *trait* (used only for the generic
+                // `Endpoint<EpType, Dir>`/`Interface::endpoint::<EpType,
+                // Dir>()` below) with no variants of its own at all. The
+                // original draft of this match matched on the trait's name
+                // as if it were this enum — impossible to have compiled as
+                // written; this was one of the specific corrections this
+                // crate's security-hardening pass made after downloading
+                // and reading the real crate source directly (`static.
+                // crates.io/crates/nusb/nusb-0.2.7.crate`) rather than
+                // continuing to write against a remembered/assumed shape —
+                // see README.md's "Development environment" note.
                 let endpoint_type = match ep.transfer_type() {
-                    nusb::transfer::EndpointType::Bulk => EndpointType::Bulk,
-                    nusb::transfer::EndpointType::Interrupt => EndpointType::Interrupt,
-                    nusb::transfer::EndpointType::Isochronous => EndpointType::Isochronous,
+                    nusb::descriptors::TransferType::Bulk => EndpointType::Bulk,
+                    nusb::descriptors::TransferType::Interrupt => EndpointType::Interrupt,
+                    nusb::descriptors::TransferType::Isochronous => EndpointType::Isochronous,
                     // Control-type endpoint descriptors don't belong in
                     // `USBAlternateInterface.endpoints` per spec — see
                     // `hardening::is_control_endpoint`'s doc comment. A
                     // compliant device never declares endpoint 0 as an
                     // explicit descriptor here, but skip defensively rather
                     // than trust every device to be well-formed.
-                    nusb::transfer::EndpointType::Control => continue,
+                    nusb::descriptors::TransferType::Control => continue,
                 };
                 let direction = match ep.direction() {
                     NusbDirection::In => Direction::In,
@@ -162,7 +183,7 @@ async fn descriptor_from_open_device(device: &Device, base: DeviceDescriptor) ->
                 interface_subclass,
                 interface_protocol,
                 interface_protected: hardening::is_protected_interface_class(interface_class),
-                interface_name: alt.description_string().map(str::to_string),
+                interface_name: hardening::sanitize_device_string_opt(alt.description_string().map(str::to_string)),
                 endpoints,
             });
         }
@@ -212,7 +233,17 @@ struct OpenSession {
     /// flight. WebUSB itself has no notion of "queue my calls on this
     /// device" and a queued-forever call would be a worse experience than
     /// an immediate, actionable rejection.
-    op_lock: Mutex<()>,
+    ///
+    /// `Arc`-wrapped so `with_session` can `clone()` the handle (bumping a
+    /// refcount, not touching `OpenSession` itself) and drop its own borrow
+    /// of `session` *before* acquiring the lock — a bare `Mutex<()>` here
+    /// would leave the guard `try_lock()` returns borrowed from `session`
+    /// itself, which conflicts with the `&mut OpenSession` `with_session`
+    /// still needs to hand to its caller's closure for the rest of the
+    /// operation. Confirmed against a real (if `nusb`/`tauri`-stubbed)
+    /// `cargo build` — the very first version of this field, a plain
+    /// `Mutex<()>`, did not actually compile as written.
+    op_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -325,6 +356,7 @@ pub async fn open_device(
     origin: &str,
     vendor_id: u16,
     product_id: u16,
+    serial_number: Option<String>,
 ) -> Result<(u32, DeviceDescriptor), WebUsbError> {
     if !settings.read(|d| d.is_origin_granted(origin, vendor_id, product_id)).await {
         return Err(WebUsbError::security(format!(
@@ -333,12 +365,51 @@ pub async fn open_device(
         )));
     }
     let candidates = enumerate().await?;
-    let candidate = candidates
-        .into_iter()
-        .find(|c| c.info.vendor_id() == vendor_id && c.info.product_id() == product_id)
+    // `USBDevice.open()` takes no arguments of its own per spec — the
+    // object already carries whichever serial number it was constructed
+    // with, from `requestDevice()`/`getDevices()` (see `commands.rs`'s
+    // `open` command and `guest-js/src/polyfill.ts`'s `USBDevice.open()`,
+    // which both thread it through transparently, invisible to page code).
+    // When one is present, prefer the exact (vendorId, productId,
+    // serialNumber) match over merely the first vendor/product ID match:
+    // multiple simultaneously-connected devices sharing one VID/PID pair
+    // are common enough in practice (identical peripherals from the same
+    // manufacturer) that always picking "whichever happens to enumerate
+    // first" can silently open the wrong physical unit. Falls back to the
+    // first VID/PID match — rather than failing outright — when no
+    // candidate's serial matches (a stale/no-longer-reported serial
+    // shouldn't make an otherwise-connected, previously-granted device
+    // unopenable), matching `bridge.py`'s own `_find_usb_device` exactly.
+    let wanted_serial = serial_number.as_deref().filter(|s| !s.is_empty());
+    let candidate = wanted_serial
+        .and_then(|serial| {
+            candidates.iter().position(|c| c.info.vendor_id() == vendor_id && c.info.product_id() == product_id && c.info.serial_number() == Some(serial))
+        })
+        .or_else(|| candidates.iter().position(|c| c.info.vendor_id() == vendor_id && c.info.product_id() == product_id))
+        .map(|i| candidates.into_iter().nth(i).expect("index was just found in this same Vec"))
         .ok_or_else(|| WebUsbError::not_found("device is not currently connected"))?;
     if hardening::device_is_fully_blocked(&candidate.descriptor) {
         return Err(WebUsbError::security("this device is on the security-key blocklist and cannot be opened"));
+    }
+
+    // 🛡️ security_report/VULNERABILITY_REPORT.md finding No.6: cap how many
+    // handles a single origin can hold open at once, evicting that origin's
+    // *oldest* handle to make room rather than failing this `open()` call —
+    // see `hardening::MAX_OPEN_HANDLES_PER_ORIGIN`'s doc comment. Checked
+    // (and, if needed, acted on) before doing the real, potentially
+    // expensive device open below, exactly mirroring `bridge.py`'s own
+    // ordering.
+    {
+        let mut guard = sessions.sessions.lock().await;
+        if guard.values().filter(|s| s.origin == origin).count() >= hardening::MAX_OPEN_HANDLES_PER_ORIGIN {
+            // Handles allocate monotonically (`SessionRegistry::alloc_handle`),
+            // so the smallest handle value among this origin's own entries
+            // is unambiguously its oldest — no separate insertion-order
+            // tracking needed.
+            if let Some(&oldest) = guard.iter().filter(|(_, s)| s.origin == origin).map(|(h, _)| h).min() {
+                guard.remove(&oldest); // drop -> nusb::Device closes the device
+            }
+        }
     }
 
     let device = candidate
@@ -354,7 +425,8 @@ pub async fn open_device(
             d.record_device_usage(vendor_id, product_id, descriptor.product_name.clone(), descriptor.manufacturer_name.clone(), &now);
             ((), true)
         })
-        .await;
+        .await
+        .map_err(|e| WebUsbError::invalid_state(format!("device was opened but its usage record could not be saved: {e}")))?;
 
     let handle = sessions.alloc_handle();
     let session = OpenSession {
@@ -365,7 +437,7 @@ pub async fn open_device(
         descriptor: descriptor.clone(),
         claimed: HashMap::new(),
         active_alternate: HashMap::new(),
-        op_lock: Mutex::new(()),
+        op_lock: Arc::new(Mutex::new(())),
     };
     sessions.sessions.lock().await.insert(handle, session);
     Ok((handle, descriptor))
@@ -373,14 +445,30 @@ pub async fn open_device(
 
 pub async fn close_device(sessions: &SessionRegistry, origin: &str, handle: u32) -> Result<(), WebUsbError> {
     let mut guard = sessions.sessions.lock().await;
-    match guard.get(&handle) {
-        Some(s) if s.origin == origin => {
+    // Deliberately `Ok(())` in every case — including a handle that exists
+    // but belongs to a *different* origin — rather than only for "already
+    // closed"/"never existed". `USBDevice.close()` is spec-idempotent (no
+    // error for an already-closed device), and every *other* handle-scoped
+    // operation in this module already makes "wrong origin" and "handle
+    // doesn't exist at all" indistinguishable by giving both the exact same
+    // `NotFoundError` (see `not_found_handle`'s doc comment) — but that
+    // approach doesn't transfer cleanly to `close`, since idempotency means
+    // "doesn't exist" must succeed, and success and failure are trivially
+    // distinguishable from each other. Handle IDs are small, guessable,
+    // monotonically-increasing integers reachable from any script with IPC
+    // access (see `gesture.rs`'s module doc comment on that same threat
+    // model generally) — an attacker distinguishing "some *other* origin
+    // currently has a handle numbered N open" from "no handle numbered N
+    // exists" by which of the two outcomes `close(N)` gave them would be a
+    // (low-severity, but free to close) cross-origin existence leak this
+    // module doesn't have anywhere else. Only actually remove the entry
+    // when the origin matches; silently no-op otherwise.
+    if let Some(s) = guard.get(&handle) {
+        if s.origin == origin {
             guard.remove(&handle); // drop -> nusb::Device closes the device
-            Ok(())
         }
-        Some(_) => Err(not_found_handle()),
-        None => Ok(()), // already closed: WebUSB's close() is idempotent, not an error
     }
+    Ok(())
 }
 
 fn not_found_handle() -> WebUsbError {
@@ -427,11 +515,12 @@ async fn with_session<T>(
     // `try_lock` (not `.lock().await`) is the actual point: a second
     // concurrent call on the *same* handle fails fast with
     // `InvalidStateError` rather than silently queuing behind the first —
-    // see `OpenSession::op_lock`'s doc comment.
-    let _op_guard = session
-        .op_lock
-        .try_lock()
-        .map_err(|_| WebUsbError::invalid_state("this device handle is busy with another operation"))?;
+    // see `OpenSession::op_lock`'s doc comment. Cloning the `Arc` (cheap: a
+    // refcount bump, not a lock acquisition) ends this borrow of `session`
+    // before `f(session)` below needs its own — see `op_lock`'s doc comment
+    // for why a bare, unwrapped `Mutex<()>` here does not compile.
+    let op_lock = session.op_lock.clone();
+    let _op_guard = op_lock.try_lock().map_err(|_| WebUsbError::invalid_state("this device handle is busy with another operation"))?;
     f(session).await
 }
 
@@ -520,10 +609,38 @@ pub async fn select_alternate_interface(
 ) -> Result<(), WebUsbError> {
     with_session(sessions, origin, handle, move |session| {
         Box::pin(async move {
-            let iface = session
-                .claimed
-                .get(&interface_number)
-                .ok_or_else(|| WebUsbError::not_found(format!("interface {interface_number} is not claimed")))?;
+            if !session.claimed.contains_key(&interface_number) {
+                return Err(WebUsbError::not_found(format!("interface {interface_number} is not claimed")));
+            }
+            // 🛡️ security_report/VULNERABILITY_REPORT.md finding No.1,
+            // `selectAlternateInterface()` half: verify the *specific*
+            // target alternate setting both exists and is not itself a
+            // protected interface class before actually switching to it.
+            // `claim_interface` above already refuses to claim an interface
+            // number where *any* alternate setting is protected — which on
+            // its own is already sufficient for this to never actually
+            // trigger — but checking again here, at the point that decides
+            // which endpoints actually become live, means neither function
+            // depends on the other's exact policy to both stay safe (see
+            // `claim_interface`'s own doc comment on why it chose the more
+            // conservative "any alternate" check rather than mirroring the
+            // reference `pyside6-webusb` project's alternative "claim
+            // checks only alternate 0, `selectAlternateInterface` checks
+            // whichever alternate is targeted" split exactly).
+            let alternates = interface_alternates(&session.descriptor, interface_number)
+                .ok_or_else(|| WebUsbError::not_found(format!("no such interface: {interface_number}")))?;
+            let target = alternates.iter().find(|a| a.alternate_setting == alternate_setting).ok_or_else(|| {
+                WebUsbError::not_found(format!("interface {interface_number} has no alternate setting {alternate_setting}"))
+            })?;
+            if target.interface_protected {
+                return Err(WebUsbError::security(format!(
+                    "cannot switch interface {interface_number} to alternate setting {alternate_setting}: \
+                     declares protected interface class {:#04x} ({})",
+                    target.interface_class,
+                    hardening::protected_class_name(target.interface_class)
+                )));
+            }
+            let iface = session.claimed.get(&interface_number).expect("presence just confirmed above");
             iface
                 .set_alt_setting(alternate_setting)
                 .await
@@ -550,16 +667,19 @@ pub async fn reset_device(sessions: &SessionRegistry, origin: &str, handle: u32)
 pub async fn clear_halt(sessions: &SessionRegistry, origin: &str, handle: u32, endpoint_number: u8, direction: Direction) -> Result<(), WebUsbError> {
     with_session(sessions, origin, handle, move |session| {
         Box::pin(async move {
+            // 🛡️ security_report/VULNERABILITY_REPORT.md finding No.1 (see
+            // `resolve_transfer_endpoint`'s doc comment): `clearHalt` needs
+            // the exact same "belongs to a claimed interface's currently
+            // selected alternate setting" check `transferIn`/`Out` do, not
+            // just "some interface, any interface, is claimed" — clearing a
+            // stall condition on an endpoint the page never claimed is
+            // unauthorized state manipulation of hardware it was never
+            // granted, independent of whether any actual data changes
+            // hands. `bridge.py`'s own `clearHalt` performs the identical
+            // check via the same underlying helper it uses for bulk/
+            // interrupt transfers.
+            let (iface, _ep_desc) = resolve_transfer_endpoint(session, endpoint_number, direction)?;
             let addr = endpoint_address(endpoint_number, direction);
-            // `clear_halt` lives on the claimed `Interface`, not `Device` —
-            // any currently-claimed interface's handle works, since it's
-            // really a device-wide `CLEAR_FEATURE` addressed by endpoint,
-            // not scoped to a particular interface claim.
-            let iface = session
-                .claimed
-                .values()
-                .next()
-                .ok_or_else(|| WebUsbError::invalid_state("no interface is currently claimed"))?;
             iface
                 .clear_halt(addr)
                 .await
@@ -585,7 +705,10 @@ pub async fn forget_device(settings: &SettingsStore, sessions: &SessionRegistry,
         }
         (session.vendor_id, session.product_id)
     };
-    settings.mutate(|d| (d.revoke_origin_grant(origin, vendor_id, product_id), true)).await;
+    settings
+        .mutate(|d| (d.revoke_origin_grant(origin, vendor_id, product_id), true))
+        .await
+        .map_err(|e| WebUsbError::invalid_state(format!("access was not revoked: {e}")))?;
     close_device(sessions, origin, handle).await
 }
 
@@ -600,21 +723,21 @@ fn endpoint_address(endpoint_number: u8, direction: Direction) -> u8 {
 // Control transfers
 // ================================================================
 
-fn combine_request_type(request_type: &str, recipient: &str) -> Result<(ControlType, Recipient), WebUsbError> {
-    let control_type = match request_type {
-        "standard" => ControlType::Standard,
-        "class" => ControlType::Class,
-        "vendor" => ControlType::Vendor,
+fn combine_request_type(request_type: &str, recipient: &str) -> Result<(ControlType, Recipient, ControlRequestType, ControlRecipient), WebUsbError> {
+    let (control_type, request_type_kind) = match request_type {
+        "standard" => (ControlType::Standard, ControlRequestType::Standard),
+        "class" => (ControlType::Class, ControlRequestType::Class),
+        "vendor" => (ControlType::Vendor, ControlRequestType::Vendor),
         other => return Err(WebUsbError::not_found(format!("unknown requestType {other:?}"))), // JS-side already TypeErrors on this; defensive only
     };
-    let recipient = match recipient {
-        "device" => Recipient::Device,
-        "interface" => Recipient::Interface,
-        "endpoint" => Recipient::Endpoint,
-        "other" => Recipient::Other,
+    let (recipient, recipient_kind) = match recipient {
+        "device" => (Recipient::Device, ControlRecipient::Device),
+        "interface" => (Recipient::Interface, ControlRecipient::Interface),
+        "endpoint" => (Recipient::Endpoint, ControlRecipient::Endpoint),
+        "other" => (Recipient::Other, ControlRecipient::Other),
         other => return Err(WebUsbError::not_found(format!("unknown recipient {other:?}"))),
     };
-    Ok((control_type, recipient))
+    Ok((control_type, recipient, request_type_kind, recipient_kind))
 }
 
 pub struct ControlSetup {
@@ -634,17 +757,48 @@ pub async fn control_transfer_in(
             hardening::CONTROL_TRANSFER_MAX_LENGTH
         )));
     }
-    let (control_type, recipient) = combine_request_type(&setup.request_type, &setup.recipient)?;
+    let (control_type, recipient, request_type_kind, recipient_kind) = combine_request_type(&setup.request_type, &setup.recipient)?;
     with_session(sessions, origin, handle, move |session| {
         Box::pin(async move {
-            // Control transfers to the Device recipient don't require any
-            // interface to be claimed (matches spec + both predecessors);
-            // Interface/Endpoint-recipient transfers are issued through
-            // whichever claimed interface's `Interface` handle happens to
-            // be available, since (like `clear_halt` above) the request is
-            // addressed by `index`, not scoped to which specific claim
-            // issues the underlying syscall.
-            let iface = any_claimed_interface(session)?;
+            // 🛡️ security_report/VULNERABILITY_REPORT.md finding No.1: `nusb`
+            // itself does not check whether `recipient`/`index` names a
+            // claimed, non-protected interface/endpoint — see
+            // `hardening::resolve_control_transfer_target`'s doc comment for
+            // exactly why, and why this check cannot be skipped just because
+            // *some* interface happens to already be claimed.
+            let target = hardening::resolve_control_transfer_target(
+                &session.descriptor,
+                |n| session.claimed.contains_key(&n),
+                |n| session.active_alternate.get(&n).copied().unwrap_or(0),
+                request_type_kind,
+                recipient_kind,
+                setup.request,
+                true, // direction_in
+                setup.index,
+            )?;
+            // Device/Other-recipient transfers still require *some* claimed
+            // interface as the vehicle `nusb` submits them through on every
+            // platform (see this function's own module-level context above:
+            // `nusb::Device::control_in`/`_out` exist and would avoid this
+            // requirement on every platform except Windows, but requiring a
+            // claim unconditionally keeps this one code path correct on
+            // every platform rather than branching on `cfg(windows)` — a
+            // pre-existing, deliberate simplification carried forward here,
+            // not a new restriction introduced by this fix. `recipient ==
+            // Interface`/`Endpoint` transfers are, independent of that
+            // simplification, now always issued through the *specific*
+            // claimed interface `resolve_control_transfer_target` names —
+            // this also happens to be exactly what Windows' WinUSB backend
+            // itself additionally requires for `recipient == Interface`
+            // (the index's low byte must match the interface you're calling
+            // through, or it returns `InvalidArgument`).
+            let iface = match target {
+                Some(iface_num) => session
+                    .claimed
+                    .get(&iface_num)
+                    .expect("resolve_control_transfer_target only names an interface number it was told is claimed"),
+                None => any_claimed_interface(session)?,
+            };
             let timeout = Duration::from_millis(hardening::scaled_transfer_timeout_ms(length as u64));
             let completion = iface
                 .control_in(
@@ -667,11 +821,27 @@ pub async fn control_transfer_out(
             data.len(), hardening::CONTROL_TRANSFER_MAX_LENGTH
         )));
     }
-    let (control_type, recipient) = combine_request_type(&setup.request_type, &setup.recipient)?;
+    let (control_type, recipient, request_type_kind, recipient_kind) = combine_request_type(&setup.request_type, &setup.recipient)?;
     let data_len = data.len() as u64;
     with_session(sessions, origin, handle, move |session| {
         Box::pin(async move {
-            let iface = any_claimed_interface(session)?;
+            let target = hardening::resolve_control_transfer_target(
+                &session.descriptor,
+                |n| session.claimed.contains_key(&n),
+                |n| session.active_alternate.get(&n).copied().unwrap_or(0),
+                request_type_kind,
+                recipient_kind,
+                setup.request,
+                false, // direction_in
+                setup.index,
+            )?;
+            let iface = match target {
+                Some(iface_num) => session
+                    .claimed
+                    .get(&iface_num)
+                    .expect("resolve_control_transfer_target only names an interface number it was told is claimed"),
+                None => any_claimed_interface(session)?,
+            };
             let timeout = Duration::from_millis(hardening::scaled_transfer_timeout_ms(data_len));
             let completion = iface
                 .control_out(ControlOut { control_type, recipient, request: setup.request, value: setup.value, index: setup.index, data: &data }, timeout)
@@ -690,17 +860,42 @@ fn any_claimed_interface(session: &OpenSession) -> Result<&Interface, WebUsbErro
 // Bulk / interrupt transfers
 // ================================================================
 
-fn find_endpoint<'a>(descriptor: &'a DeviceDescriptor, endpoint_number: u8, direction: Direction) -> Option<&'a EndpointDescriptor> {
-    let active_cfg = descriptor.active_configuration_value?;
-    descriptor
-        .configurations
-        .iter()
-        .find(|c| c.configuration_value == active_cfg)?
-        .interfaces
-        .iter()
-        .flat_map(|i| i.alternates.iter())
-        .flat_map(|a| a.endpoints.iter())
-        .find(|e| e.endpoint_number == endpoint_number && e.direction == direction)
+/// Resolves `endpoint_number`/`direction` to the *specific* claimed
+/// interface that currently owns it, together with its descriptor (type,
+/// packet size) — see `hardening::resolve_transfer_endpoint_owner`'s doc
+/// comment for why this only ever considers claimed interfaces at their
+/// currently-selected alternate setting (`security_report/
+/// VULNERABILITY_REPORT.md` finding No.1). This replaces what used to be
+/// two independent, inconsistent lookups here: a global, claim-unaware
+/// `find_endpoint()` search (for the descriptor) plus a separate
+/// `any_claimed_interface()` call (for *some* claimed interface's handle,
+/// regardless of whether it was actually the one owning this endpoint) —
+/// harmless by accident only because `nusb`'s own `Interface::endpoint()`
+/// happens to re-scope to whichever specific interface object it's called
+/// on and so silently failed shut for a genuinely cross-interface call,
+/// but was still a real functional bug for any device with more than one
+/// simultaneously claimed interface (whichever interface
+/// `any_claimed_interface` happened to return first was the only one
+/// `transferIn`/`Out` could ever actually use, regardless of which
+/// interface the requested endpoint number really belonged to).
+fn resolve_transfer_endpoint<'a>(
+    session: &'a OpenSession, endpoint_number: u8, direction: Direction,
+) -> Result<(&'a Interface, EndpointDescriptor), WebUsbError> {
+    if !hardening::is_valid_transfer_endpoint_number(endpoint_number) {
+        return Err(WebUsbError::index_size(format!("endpoint number {endpoint_number} is out of range (must be 1-15)")));
+    }
+    let addr = endpoint_address(endpoint_number, direction);
+    let (owner_number, ep_desc) = hardening::resolve_transfer_endpoint_owner(
+        &session.descriptor,
+        |n| session.claimed.contains_key(&n),
+        |n| session.active_alternate.get(&n).copied().unwrap_or(0),
+        addr,
+    )?;
+    let iface = session
+        .claimed
+        .get(&owner_number)
+        .expect("resolve_transfer_endpoint_owner only ever names an interface number it was told is claimed");
+    Ok((iface, ep_desc))
 }
 
 /// nusb requires an IN request's buffer length to be an exact multiple of
@@ -734,13 +929,10 @@ pub async fn transfer_in(sessions: &SessionRegistry, origin: &str, handle: u32, 
     }
     with_session(sessions, origin, handle, move |session| {
         Box::pin(async move {
-            let ep_desc = find_endpoint(&session.descriptor, endpoint_number, Direction::In)
-                .ok_or_else(|| WebUsbError::not_found(format!("no such IN endpoint: {endpoint_number}")))?
-                .clone();
+            let (iface, ep_desc) = resolve_transfer_endpoint(session, endpoint_number, Direction::In)?;
             if ep_desc.endpoint_type == EndpointType::Isochronous {
                 return Err(WebUsbError::invalid_access("use isochronousTransferIn() for an isochronous endpoint"));
             }
-            let iface = any_claimed_interface(session)?;
             let submit_len = round_up_to_packet_multiple(length, ep_desc.packet_size);
             let timeout = Duration::from_millis(hardening::scaled_transfer_timeout_ms(length as u64));
             let addr = endpoint_address(endpoint_number, Direction::In);
@@ -773,13 +965,10 @@ pub async fn transfer_out(sessions: &SessionRegistry, origin: &str, handle: u32,
     let data_len = data.len() as u64;
     with_session(sessions, origin, handle, move |session| {
         Box::pin(async move {
-            let ep_desc = find_endpoint(&session.descriptor, endpoint_number, Direction::Out)
-                .ok_or_else(|| WebUsbError::not_found(format!("no such OUT endpoint: {endpoint_number}")))?
-                .clone();
+            let (iface, ep_desc) = resolve_transfer_endpoint(session, endpoint_number, Direction::Out)?;
             if ep_desc.endpoint_type == EndpointType::Isochronous {
                 return Err(WebUsbError::invalid_access("use isochronousTransferOut() for an isochronous endpoint"));
             }
-            let iface = any_claimed_interface(session)?;
             let timeout = Duration::from_millis(hardening::scaled_transfer_timeout_ms(data_len));
             let addr = endpoint_address(endpoint_number, Direction::Out);
 
@@ -890,6 +1079,13 @@ fn transfer_completion_to_out_result(status: Result<(), nusb::transfer::Transfer
 pub async fn isochronous_transfer_in(
     sessions: &SessionRegistry, origin: &str, handle: u32, endpoint_number: u8, packet_lengths: Vec<u32>,
 ) -> Result<Vec<IsochronousInPacket>, WebUsbError> {
+    if packet_lengths.len() > hardening::MAX_ISOCHRONOUS_PACKETS {
+        return Err(WebUsbError::data_error(format!(
+            "packetLengths has {} entries, exceeding this implementation's {}-entry ceiling",
+            packet_lengths.len(),
+            hardening::MAX_ISOCHRONOUS_PACKETS
+        )));
+    }
     let total: u64 = packet_lengths.iter().map(|&l| l as u64).sum();
     if total > hardening::ISOCHRONOUS_TRANSFER_MAX_TOTAL_LENGTH {
         return Err(WebUsbError::data_error(format!(
@@ -899,12 +1095,10 @@ pub async fn isochronous_transfer_in(
     }
     with_session(sessions, origin, handle, move |session| {
         Box::pin(async move {
-            let ep_desc = find_endpoint(&session.descriptor, endpoint_number, Direction::In)
-                .ok_or_else(|| WebUsbError::not_found(format!("no such IN endpoint: {endpoint_number}")))?;
-            if !hardening::is_isochronous_endpoint(ep_desc) {
+            let (_iface, ep_desc) = resolve_transfer_endpoint(session, endpoint_number, Direction::In)?;
+            if !hardening::is_isochronous_endpoint(&ep_desc) {
                 return Err(WebUsbError::invalid_access(format!("endpoint {endpoint_number} is not an isochronous endpoint")));
             }
-            let _ = any_claimed_interface(session)?; // still require a claim, per spec, even though we reject below
             Err(isochronous_not_supported())
         })
     })
@@ -914,6 +1108,13 @@ pub async fn isochronous_transfer_in(
 pub async fn isochronous_transfer_out(
     sessions: &SessionRegistry, origin: &str, handle: u32, endpoint_number: u8, data: Vec<u8>, packet_lengths: Vec<u32>,
 ) -> Result<Vec<IsochronousOutPacket>, WebUsbError> {
+    if packet_lengths.len() > hardening::MAX_ISOCHRONOUS_PACKETS {
+        return Err(WebUsbError::data_error(format!(
+            "packetLengths has {} entries, exceeding this implementation's {}-entry ceiling",
+            packet_lengths.len(),
+            hardening::MAX_ISOCHRONOUS_PACKETS
+        )));
+    }
     let total: u64 = packet_lengths.iter().map(|&l| l as u64).sum();
     if total != data.len() as u64 {
         // Real Blink behavior (confirmed by pyside6-webusb v0.0.4b2 against
@@ -933,12 +1134,10 @@ pub async fn isochronous_transfer_out(
     }
     with_session(sessions, origin, handle, move |session| {
         Box::pin(async move {
-            let ep_desc = find_endpoint(&session.descriptor, endpoint_number, Direction::Out)
-                .ok_or_else(|| WebUsbError::not_found(format!("no such OUT endpoint: {endpoint_number}")))?;
-            if !hardening::is_isochronous_endpoint(ep_desc) {
+            let (_iface, ep_desc) = resolve_transfer_endpoint(session, endpoint_number, Direction::Out)?;
+            if !hardening::is_isochronous_endpoint(&ep_desc) {
                 return Err(WebUsbError::invalid_access(format!("endpoint {endpoint_number} is not an isochronous endpoint")));
             }
-            let _ = any_claimed_interface(session)?;
             Err(isochronous_not_supported())
         })
     })
@@ -1031,8 +1230,17 @@ mod tests {
 
     #[test]
     fn civil_from_days_known_date() {
-        // 2026-09-04 is 20701 days after the epoch.
-        assert_eq!(civil_from_days(20701), (2026, 9, 4));
+        // 🔧 Corrected during this crate's security-hardening pass: this
+        // test failed when actually run (see README.md's "Development
+        // environment" note on how — against a stubbed-out `nusb`/`tauri`,
+        // since this specific function needs neither). The *algorithm*
+        // (Howard Hinnant's `civil_from_days`, verified against
+        // http://howardhinnant.github.io/date_algorithms.html) was correct
+        // all along; this test's own hand-computed expected value was off
+        // by one day, confirmed independently against Python's
+        // `datetime.date(1970, 1, 1) + timedelta(days=20701)`. 2026-09-05,
+        // not 2026-09-04, is 20701 days after the epoch.
+        assert_eq!(civil_from_days(20701), (2026, 9, 5));
     }
 
     #[test]

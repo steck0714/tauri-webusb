@@ -53,13 +53,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 /// Identity key for one physical, currently-connected device across
 /// consecutive polls. `(vendorId, productId)` alone isn't enough (two
 /// identical devices could be plugged in at once); `nusb::DeviceInfo`'s own
-/// bus/address pair is what actually distinguishes them — see `bridge.rs`'s
-/// module doc comment on why the exact accessor names for these are one of
-/// the less-certain spots. If `busId`/`deviceAddress`-equivalent fields turn
-/// out to have different names in the `nusb` version actually resolved,
-/// this type (and only the snapshot-taking code in `run`, not
-/// `diff_snapshots`) is what needs adjusting.
-type PhysicalDeviceId = (u32, u32);
+/// bus/address pair is what would actually distinguish them — see this
+/// module's `snapshot()` doc comment on why this is, for now, a
+/// `(vendorId << 16 | productId)` stand-in rather than that real pair (and
+/// so a single `u32`, not the two-value tuple a real bus/address identity
+/// would be — an earlier draft of this type declared exactly that
+/// mismatched tuple shape while the code building one had already settled
+/// for the `u32` stand-in, which does not actually compile: the value
+/// `snapshot()` builds has never been a 2-tuple). If `busId`/
+/// `deviceAddress`-equivalent fields become available from `bridge.rs` in
+/// the future, reintroducing a real tuple here (and updating `snapshot()`
+/// to build one) is the only change needed — `diff_snapshots` itself is
+/// generic over whatever this type is.
+type PhysicalDeviceId = u32;
 
 struct TrackedDevice {
     vendor_id: u16,
@@ -131,11 +137,11 @@ async fn snapshot() -> Result<Vec<(PhysicalDeviceId, u16, u16, DeviceDescriptor)
     // candidate — see `bridge.rs`'s module doc comment on that split.
     let match_everything = [UsbDeviceFilter::default()];
     let descriptors = bridge::candidates_for_chooser(&match_everything, &[]).await.map_err(|_| ())?;
-    // 🔍 Physical identity: see this module's doc comment on
-    // `PhysicalDeviceId` — `bridge::candidates_for_chooser` doesn't currently
-    // plumb bus/address through (it only needs vendor/product for filter
-    // matching), so for now this uses `(vendorId, productId)` as a stand-in
-    // identity. This is a real, documented simplification versus true
+    // 🔍 Physical identity: see `PhysicalDeviceId`'s doc comment —
+    // `bridge::candidates_for_chooser` doesn't currently plumb bus/address
+    // through (it only needs vendor/product for filter matching), so for
+    // now this uses `(vendorId << 16 | productId)` as a stand-in identity.
+    // This is a real, documented simplification versus true
     // per-physical-device identity: two simultaneously-connected identical
     // devices will be indistinguishable to the hotplug diff (unplugging one
     // of the two will not reliably fire exactly one disconnect event tied
@@ -175,8 +181,8 @@ mod tests {
 
     #[test]
     fn no_change_produces_no_added_or_removed() {
-        let ids = vec![(1, 2)];
-        let current = vec![((1, 2), 0x1234, 0x5678)];
+        let ids = vec![0x1234_5678u32];
+        let current = vec![(0x1234_5678u32, 0x1234, 0x5678)];
         let (added, removed) = diff_snapshots(&ids, &current);
         assert!(added.is_empty());
         assert!(removed.is_empty());
@@ -185,36 +191,36 @@ mod tests {
     #[test]
     fn new_device_is_reported_as_added() {
         let previous: Vec<PhysicalDeviceId> = vec![];
-        let current = vec![((1, 2), 0x1234, 0x5678)];
+        let current = vec![(0x1234_5678u32, 0x1234, 0x5678)];
         let (added, removed) = diff_snapshots(&previous, &current);
-        assert_eq!(added, vec![((1, 2), 0x1234, 0x5678)]);
+        assert_eq!(added, vec![(0x1234_5678u32, 0x1234, 0x5678)]);
         assert!(removed.is_empty());
     }
 
     #[test]
     fn unplugged_device_is_reported_as_removed() {
-        let previous = vec![(1, 2)];
-        let current: Vec<((u32, u32), u16, u16)> = vec![];
+        let previous = vec![0x1234_5678u32];
+        let current: Vec<(u32, u16, u16)> = vec![];
         let (added, removed) = diff_snapshots(&previous, &current);
         assert!(added.is_empty());
-        assert_eq!(removed, vec![(1, 2)]);
+        assert_eq!(removed, vec![0x1234_5678u32]);
     }
 
     #[test]
     fn one_added_and_one_removed_in_the_same_tick() {
-        let previous = vec![(1, 2)];
-        let current = vec![((3, 4), 0xaaaa, 0xbbbb)];
+        let previous = vec![0x1234_5678u32];
+        let current = vec![(0xaaaa_bbbbu32, 0xaaaa, 0xbbbb)];
         let (added, removed) = diff_snapshots(&previous, &current);
-        assert_eq!(added, vec![((3, 4), 0xaaaa, 0xbbbb)]);
-        assert_eq!(removed, vec![(1, 2)]);
+        assert_eq!(added, vec![(0xaaaa_bbbbu32, 0xaaaa, 0xbbbb)]);
+        assert_eq!(removed, vec![0x1234_5678u32]);
     }
 
     #[test]
     fn unrelated_still_connected_devices_are_untouched() {
-        let previous = vec![(1, 2), (5, 6)];
-        let current = vec![((1, 2), 0x1111, 0x2222), ((5, 6), 0x3333, 0x4444), ((7, 8), 0x5555, 0x6666)];
+        let previous = vec![0x1111_2222u32, 0x3333_4444u32];
+        let current = vec![(0x1111_2222u32, 0x1111, 0x2222), (0x3333_4444u32, 0x3333, 0x4444), (0x5555_6666u32, 0x5555, 0x6666)];
         let (added, removed) = diff_snapshots(&previous, &current);
-        assert_eq!(added, vec![((7, 8), 0x5555, 0x6666)]);
+        assert_eq!(added, vec![(0x5555_6666u32, 0x5555, 0x6666)]);
         assert!(removed.is_empty());
     }
 
@@ -227,7 +233,7 @@ mod tests {
 
     #[test]
     fn everything_disconnecting_at_once_reports_all_of_them() {
-        let previous = vec![(1, 1), (2, 2), (3, 3)];
+        let previous = vec![1u32, 2u32, 3u32];
         let (added, removed) = diff_snapshots(&previous, &[]);
         assert!(added.is_empty());
         assert_eq!(removed.len(), 3);

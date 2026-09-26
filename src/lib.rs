@@ -34,6 +34,7 @@ mod bridge;
 mod chooser;
 mod commands;
 mod error;
+mod gesture;
 mod hardening;
 mod hotplug;
 mod models;
@@ -63,6 +64,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("webusb")
         .invoke_handler(tauri::generate_handler![
             commands::get_devices,
+            commands::mint_gesture_token,
             commands::request_device,
             commands::open,
             commands::close,

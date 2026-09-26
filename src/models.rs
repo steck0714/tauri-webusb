@@ -133,6 +133,55 @@ pub struct EndpointDescriptor {
 }
 
 // ================================================================
+// Control transfer request type / recipient
+// ================================================================
+// `USBControlTransferParameters.requestType`/`.recipient` are spec-defined
+// strings (not the raw `bmRequestType` byte a real USB SETUP packet uses —
+// that's `combine_request_type` in `bridge.rs`'s job, once these are known
+// valid). Decoding them into a small closed enum here, rather than passing
+// `&str` around, is what lets `hardening::resolve_control_transfer_target`
+// match exhaustively instead of needing a fallback arm for "some other
+// string" at every call site.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlRequestType {
+    Standard,
+    Class,
+    Vendor,
+}
+
+impl ControlRequestType {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "standard" => Some(Self::Standard),
+            "class" => Some(Self::Class),
+            "vendor" => Some(Self::Vendor),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlRecipient {
+    Device,
+    Interface,
+    Endpoint,
+    Other,
+}
+
+impl ControlRecipient {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "device" => Some(Self::Device),
+            "interface" => Some(Self::Interface),
+            "endpoint" => Some(Self::Endpoint),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
+// ================================================================
 // requestDevice() / getDevices() filters
 // ================================================================
 // Mirrors USBDeviceFilter. Every field optional; presence/absence is
@@ -299,5 +348,23 @@ mod tests {
         let r = InTransferResult { status: TransferStatus::Ok, data: "".into(), warning: None };
         let json = serde_json::to_value(&r).unwrap();
         assert!(json.get("warning").is_none());
+    }
+
+    #[test]
+    fn control_request_type_parses_the_three_spec_strings() {
+        assert_eq!(ControlRequestType::parse("standard"), Some(ControlRequestType::Standard));
+        assert_eq!(ControlRequestType::parse("class"), Some(ControlRequestType::Class));
+        assert_eq!(ControlRequestType::parse("vendor"), Some(ControlRequestType::Vendor));
+        assert_eq!(ControlRequestType::parse("Standard"), None, "case-sensitive, matches the wire shape exactly");
+        assert_eq!(ControlRequestType::parse("bogus"), None);
+    }
+
+    #[test]
+    fn control_recipient_parses_the_four_spec_strings() {
+        assert_eq!(ControlRecipient::parse("device"), Some(ControlRecipient::Device));
+        assert_eq!(ControlRecipient::parse("interface"), Some(ControlRecipient::Interface));
+        assert_eq!(ControlRecipient::parse("endpoint"), Some(ControlRecipient::Endpoint));
+        assert_eq!(ControlRecipient::parse("other"), Some(ControlRecipient::Other));
+        assert_eq!(ControlRecipient::parse("bogus"), None);
     }
 }

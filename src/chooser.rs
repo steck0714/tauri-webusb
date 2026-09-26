@@ -40,7 +40,7 @@
 //! plugin picks the chooser window's label itself
 //! (`tauri-webusb-chooser-{origin-hash}`) when creating it, and every
 //! chooser-only command checks — via the same `tauri::Window`/`Webview`
-///   dependency-injection mechanism `origin.rs` uses for `.url()` — that the
+//!   dependency-injection mechanism `origin.rs` uses for `.url()` — that the
 //! *calling* window's label matches the label of the currently-open chooser
 //! session before doing anything. An ordinary page window has whatever
 //! label the host app gave it, which cannot collide with a label this
@@ -52,7 +52,7 @@ use crate::hardening;
 use crate::models::{DeviceDescriptor, UsbDeviceFilter};
 use crate::error::WebUsbError;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Runtime, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::{oneshot, Mutex};
 
 const CHOOSER_UI_HTML: &str = include_str!("../chooser-ui/index.html");
@@ -104,7 +104,7 @@ impl ChooserRegistry {
 /// single-instance assumption).
 pub async fn run<R: Runtime>(
     app: &AppHandle<R>,
-    chooser: &ChooserRegistry,
+    chooser: Arc<ChooserRegistry>,
     origin: &str,
     filters: Vec<UsbDeviceFilter>,
     exclusion_filters: Vec<UsbDeviceFilter>,
@@ -153,25 +153,14 @@ pub async fn run<R: Runtime>(
     // still resolve the pending `requestDevice()` call (as a rejection) —
     // otherwise the page's promise would simply hang forever.
     {
-        let chooser_for_close = chooser as *const ChooserRegistry as usize; // see note below
+        let chooser_for_close = Arc::clone(&chooser);
         let label_for_close = window_label.clone();
         window.on_window_event(move |event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed) {
-                // SAFETY: `chooser` outlives every window this function
-                // creates — the caller (`commands.rs::request_device`) holds
-                // `tauri::State<WebUsbState>` for the whole lifetime of the
-                // Tauri app, and this closure only ever runs while that
-                // state is alive. Reconstructing the reference from a raw
-                // pointer here (rather than capturing `&ChooserRegistry`
-                // directly) is only needed because `on_window_event`'s
-                // closure bound requires `'static`, and threading an `Arc`
-                // through would mean `ChooserRegistry` itself has to be
-                // `Arc`-wrapped everywhere it's used elsewhere in the crate
-                // for no other reason than this one callback.
-                let chooser_ref = unsafe { &*(chooser_for_close as *const ChooserRegistry) };
+                let chooser_for_task = Arc::clone(&chooser_for_close);
                 let label = label_for_close.clone();
                 tauri::async_runtime::spawn(async move {
-                    resolve_if_matching(chooser_ref, &label, ChooserOutcome::Cancelled).await;
+                    resolve_if_matching(&chooser_for_task, &label, ChooserOutcome::Cancelled).await;
                 });
             }
         });
@@ -255,11 +244,20 @@ pub async fn submit_selection(chooser: &ChooserRegistry, caller_window_label: &s
     if active.window_label != caller_window_label {
         return false;
     }
-    if let Some(tx) = active.outcome_tx.lock().await.take() {
-        let _ = tx.send(ChooserOutcome::Selected { vendor_id, product_id });
-        true
-    } else {
-        false
+    // Bound to `sender` as its own statement (rather than matching directly
+    // on `active.outcome_tx.lock().await.take()`) so the `MutexGuard`
+    // `.lock().await` returns is fully dropped before this function's tail
+    // expression — matching directly on it here does not actually compile:
+    // the guard's temporary scope extends to the end of the enclosing
+    // block, conflicting with `active` (borrowed from `chooser`, a `&`
+    // parameter) needing to have already been dropped by then too.
+    let sender = active.outcome_tx.lock().await.take();
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(ChooserOutcome::Selected { vendor_id, product_id });
+            true
+        }
+        None => false,
     }
 }
 
@@ -268,11 +266,13 @@ pub async fn submit_cancel(chooser: &ChooserRegistry, caller_window_label: &str)
     if active.window_label != caller_window_label {
         return false;
     }
-    if let Some(tx) = active.outcome_tx.lock().await.take() {
-        let _ = tx.send(ChooserOutcome::Cancelled);
-        true
-    } else {
-        false
+    let sender = active.outcome_tx.lock().await.take(); // see submit_selection's comment on why this can't be inlined into the match below
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(ChooserOutcome::Cancelled);
+            true
+        }
+        None => false,
     }
 }
 
