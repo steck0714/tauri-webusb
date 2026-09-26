@@ -1,0 +1,35 @@
+{
+  "name": "tauri-plugin-webusb-api",
+  "version": "0.0.0",
+  "description": "JavaScript/TypeScript bindings for tauri-plugin-webusb: a navigator.usb (WebUSB) polyfill for Tauri apps",
+  "type": "module",
+  "main": "./dist-js/index.js",
+  "types": "./dist-js/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist-js/index.d.ts",
+      "import": "./dist-js/index.js"
+    }
+  },
+  "files": [
+    "dist-js"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "pretest": "tsc",
+    "test": "node --test dist-js/__tests__/"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/example/tauri-webusb"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^7.0"
+  }
+}
